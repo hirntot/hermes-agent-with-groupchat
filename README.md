@@ -10,6 +10,13 @@
 > [GROUPCHAT_FORK.md](GROUPCHAT_FORK.md) and the
 > [Groupchat addon documentation](plugins/groupchat/README.md).
 
+> ### A small note from RechnerLotsen
+>
+> Zu viele Anfragen aus deiner Verwandtschaft nach Computer-Support? Kennen wir.
+> Deshalb haben wir [RechnerLotsen](https://rechnerlotsen.com/) gegründet:
+> IT-Support auf Abo-Basis für Privatpersonen – inklusive begleiteter Umstellung
+> auf Linux.
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
