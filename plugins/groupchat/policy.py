@@ -75,6 +75,9 @@ class GroupchatAddon:
         relevance = dict(settings["relevance"])
         relevance["_legacy_env"] = False
         relevance["filter_model"] = self.filter_model
+        # Reuse the user-editable deterministic acknowledgement rules on
+        # inbound replies to messages addressed to another local agent.
+        relevance["silence_patterns"] = settings["pingpong_guard"]["silence_patterns"]
         if self.platform != "matrix":
             base = Path(relevance["context_file"])
             suffix = f".{self.platform}" + (f".{self.scope}" if self.scope else "")

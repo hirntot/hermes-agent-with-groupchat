@@ -362,9 +362,45 @@ async def test_plain_peer_name_is_dropped_before_scoring_or_buffering(tmp_path):
     ]
     assert [record["reason_code"] for record in records[-2:]] == [
         "plain_name_addressed_to_peer",
-        "reply_to_peer_targeted_message",
+        "peer_reply_pingpong",
     ]
     assert all(record["explicitly_addressed_elsewhere"] for record in records[-2:])
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_substantive_peer_reply_can_trigger_a_contribution(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True},
+        "pingpong_guard": {"enabled": True},
+    })
+    gate = adapter.conversation_policy().relevance
+    gate._peer_names = ["charlotte"]
+    gate._peer_name_pattern = gate._names_pattern(gate._peer_names)
+
+    request = event(Platform.MATRIX, text="Charlotte, please assess this proposal")
+    request.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(request)
+
+    gate._throttled_evaluate = AsyncMock(
+        return_value=(5, "Another agent can add a useful correction.")
+    )
+    peer_reply = event(
+        Platform.MATRIX,
+        text=(
+            "The proposal has a concrete compatibility risk in its storage "
+            "format that should be considered before implementation."
+        ),
+    )
+    peer_reply.message_id = "substantive-peer-reply"
+    peer_reply.reply_to_message_id = request.message_id
+    peer_reply.source.user_id = "@charlotte_ai:example.test"
+    peer_reply.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(peer_reply)
+
+    assert len(adapter.delivered) == 1
+    assert "compatibility risk" in adapter.delivered[0].text
+    gate._throttled_evaluate.assert_awaited_once()
     await adapter.disconnect()
 
 

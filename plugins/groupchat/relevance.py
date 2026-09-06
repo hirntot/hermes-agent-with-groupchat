@@ -269,6 +269,7 @@ class IntelligentReactionGate:
             previous = self._settings.get("interrupt_notice", _INTERRUPT_NOTICE)
             phrases = [previous] if previous else []
         self._literal_phrases = [(i, phrase) for i, phrase in enumerate(phrases, 1) if phrase.strip() and not phrase.lstrip().startswith("#")]
+        self._silence_patterns = self._settings.get("silence_patterns")
         self._interrupt_notice = self._settings.get("interrupt_notice", _INTERRUPT_NOTICE)
         for line, pat in enumerate(system_patterns, 1):
             if not pat.strip() or pat.lstrip().startswith("#"):
@@ -1016,8 +1017,9 @@ class IntelligentReactionGate:
 
         # Plain-language agent names are transport-neutral addressing. The
         # target behaves like it was mentioned; every other local Groupchat
-        # participant drops the request before scoring or buffering. This also
-        # prevents a later peer reply from flushing a non-target's old buffer.
+        # participant keeps the request as context without scoring or buffering.
+        # Trivial replies remain context-only, while substantive replies are
+        # still scored so another agent can contribute when useful.
         own_name_match = bool(self._name_pattern_for_room(room).search(text))
         peer_name_match = bool(self._peer_name_pattern.search(text))
         inherited_peer_target = bool(
@@ -1028,20 +1030,23 @@ class IntelligentReactionGate:
         if not is_mentioned and own_name_match:
             is_mentioned = True
         elif not is_mentioned and inherited_peer_target:
-            if msg_event.message_id:
-                self._peer_targeted_event_ids.setdefault(room, set()).add(
-                    msg_event.message_id
+            from plugins.groupchat.pingpong_guard import obvious_pingpong
+
+            if obvious_pingpong(text, self._silence_patterns):
+                if msg_event.message_id:
+                    self._peer_targeted_event_ids.setdefault(room, set()).add(
+                        msg_event.message_id
+                    )
+                self._audit(
+                    msg_event,
+                    phase="decision",
+                    decision="drop",
+                    reason_code="peer_reply_pingpong",
+                    addressed_elsewhere=True,
+                    dispatch_attempted=False,
                 )
-            self._audit(
-                msg_event,
-                phase="decision",
-                decision="drop",
-                reason_code="reply_to_peer_targeted_message",
-                addressed_elsewhere=True,
-                dispatch_attempted=False,
-            )
-            _commit_to_transcript()
-            return
+                _commit_to_transcript()
+                return
         elif not is_mentioned and peer_name_match:
             if msg_event.message_id:
                 self._peer_targeted_event_ids.setdefault(room, set()).add(
