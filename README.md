@@ -10,11 +10,11 @@
 > [GROUPCHAT_FORK.md](GROUPCHAT_FORK.md) and the
 > [Groupchat addon documentation](plugins/groupchat/README.md).
 
-> ### A small note from RechnerLotsen
+> ### A small note from RechnerLotsen (german-only!)
 >
 > Zu viele Anfragen aus deiner Verwandtschaft nach Computer-Support? Kennen wir.
 > Deshalb haben wir [RechnerLotsen](https://rechnerlotsen.com/) gegründet:
-> IT-Support auf Abo-Basis für Privatpersonen – inklusive begleiteter Umstellung
+> IT-Support für Privatpersonen zum Fixpreis vün 1€/Tag – inklusive vollständiger Umstellung
 > auf Linux.
 
 <p align="center">
