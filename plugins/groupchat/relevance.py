@@ -302,6 +302,9 @@ class IntelligentReactionGate:
         ).strip() or self._resolve_codex_model_from_config()
         self._pending: Dict[str, _PendingBuffer] = {}
         self._mentioned_event_ids: Dict[str, Set[str]] = {}
+        # Messages explicitly addressed to another local Groupchat profile.
+        # Replies to these stay context-only unless this agent is mentioned.
+        self._peer_targeted_event_ids: Dict[str, Set[str]] = {}
         # Track message IDs sent by this agent so replies to them are treated
         # as thread continuations (a user replying to the agent's own message
         # is effectively addressing the agent, even without an @-mention).
@@ -1017,9 +1020,33 @@ class IntelligentReactionGate:
         # prevents a later peer reply from flushing a non-target's old buffer.
         own_name_match = bool(self._name_pattern_for_room(room).search(text))
         peer_name_match = bool(self._peer_name_pattern.search(text))
+        inherited_peer_target = bool(
+            msg_event.reply_to_message_id
+            and msg_event.reply_to_message_id
+            in self._peer_targeted_event_ids.get(room, set())
+        )
         if not is_mentioned and own_name_match:
             is_mentioned = True
+        elif not is_mentioned and inherited_peer_target:
+            if msg_event.message_id:
+                self._peer_targeted_event_ids.setdefault(room, set()).add(
+                    msg_event.message_id
+                )
+            self._audit(
+                msg_event,
+                phase="decision",
+                decision="drop",
+                reason_code="reply_to_peer_targeted_message",
+                addressed_elsewhere=True,
+                dispatch_attempted=False,
+            )
+            _commit_to_transcript()
+            return
         elif not is_mentioned and peer_name_match:
+            if msg_event.message_id:
+                self._peer_targeted_event_ids.setdefault(room, set()).add(
+                    msg_event.message_id
+                )
             self._audit(
                 msg_event,
                 phase="decision",

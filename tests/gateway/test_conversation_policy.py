@@ -341,16 +341,30 @@ async def test_plain_peer_name_is_dropped_before_scoring_or_buffering(tmp_path):
     message.metadata["conversation_mentioned"] = False
     await adapter.handle_message(message)
 
+    peer_reply = event(Platform.MATRIX, text="OK")
+    peer_reply.message_id = "peer-reply"
+    peer_reply.reply_to_message_id = message.message_id
+    peer_reply.source.user_id = "@charlotte_ai:example.test"
+    peer_reply.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(peer_reply)
+
     assert adapter.delivered == []
     assert gate._pending == {}
-    assert gate._room_transcript["same-room"][-1][1] == message.text
-    record = json.loads(
-        (tmp_path / "logs/matrix-relevance-decisions.jsonl")
+    assert [entry[1] for entry in gate._room_transcript["same-room"][-2:]] == [
+        message.text,
+        "OK",
+    ]
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "logs/matrix-relevance-decisions.jsonl")
         .read_text()
-        .splitlines()[-1]
-    )
-    assert record["reason_code"] == "plain_name_addressed_to_peer"
-    assert record["explicitly_addressed_elsewhere"] is True
+        .splitlines()
+    ]
+    assert [record["reason_code"] for record in records[-2:]] == [
+        "plain_name_addressed_to_peer",
+        "reply_to_peer_targeted_message",
+    ]
+    assert all(record["explicitly_addressed_elsewhere"] for record in records[-2:])
     await adapter.disconnect()
 
 
