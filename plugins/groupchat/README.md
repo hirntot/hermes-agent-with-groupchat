@@ -81,7 +81,8 @@ groupchat:
         model: "" # use this profile's Codex model
   relevance:
     enabled: true
-    score_delays: {5: 0, 4: 3, 3: 10, 2: 30, 1: 120}
+    # Score 0 is discarded; score 1 is passive context without a timer.
+    score_delays: {5: 0, 4: 3, 3: 10, 2: 30}
   pingpong_guard:
     enabled: true
     min_chars: 60
@@ -90,6 +91,14 @@ groupchat:
 Credentials continue to use the existing provider credentials/OAuth in the
 active Hermes profile. Neither the dashboard nor the configuration contains
 copies of keys. The model ID is freely editable, not a frozen catalog.
+
+The relevance model always scores only the newest message. Recent room
+messages are supplied as context, never merged into one item for scoring.
+Score `0` is discarded. Score `1` has no delivery timer and remains passive
+context until a score `2`–`5` message (or a direct address) starts an agent
+turn. That turn receives the retained context; successful dispatch consumes
+it. Explicit conversations addressed to another local Groupchat profile use
+the same score-1 context lane.
 
 Native transport authorization, allowed-room rules, bot admission and
 mention-only policies are not loosened by this addon. To score unmentioned

@@ -53,7 +53,7 @@ class FilterModel(ModelChoice):
 class RelevanceSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = True
-    score_delays: dict[int, int] = Field(default_factory=lambda: {5: 0, 4: 3, 3: 10, 2: 30, 1: 120})
+    score_delays: dict[int, int] = Field(default_factory=lambda: {5: 0, 4: 3, 3: 10, 2: 30})
     max_context_messages: int = Field(5, ge=1, le=100)
     context_cooldown_seconds: float = Field(3600, ge=0, le=86400)
     typing_delay: float = Field(10, ge=0, le=300)
@@ -115,8 +115,12 @@ def validate_settings(raw):
     if settings.pingpong_guard.silence_patterns is None:
         settings.pingpong_guard.silence_patterns = list(SILENCE_PATTERNS)
     delays = settings.relevance.score_delays
-    if set(delays) != {1, 2, 3, 4, 5} or any(v < 0 or v > 86400 for v in delays.values()):
-        raise ValueError("score_delays must map scores 1–5 to delays between 0 and 86400 seconds")
+    # Before score 1 became passive context it had a delivery delay. Accept
+    # and discard that legacy key so existing configurations migrate in place.
+    if set(delays) == {1, 2, 3, 4, 5}:
+        delays.pop(1)
+    if set(delays) != {2, 3, 4, 5} or any(v < 0 or v > 86400 for v in delays.values()):
+        raise ValueError("score_delays must map scores 2–5 to delays between 0 and 86400 seconds")
     if settings.relevance.voice_delay_max < settings.relevance.voice_delay_min:
         raise ValueError("voice_delay_max must not be less than voice_delay_min")
     import re

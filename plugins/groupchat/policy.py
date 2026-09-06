@@ -29,7 +29,8 @@ def requires_buffered_delivery(config, platform):
 
 
 class GroupchatAddon:
-    def __init__(self, adapter, *, scope="", shared_room_transcript=None):
+    def __init__(self, adapter, *, scope="", shared_room_transcript=None,
+                 shared_passive_context=None, shared_peer_targeted_ids=None):
         self.adapter = adapter
         self._dispatch = adapter._handle_message_after_conversation
         platform = getattr(adapter, "platform", "")
@@ -48,7 +49,19 @@ class GroupchatAddon:
             if shared_room_transcript is not None
             else {}
         )
+        self._shared_passive_context = (
+            shared_passive_context
+            if shared_passive_context is not None
+            else {}
+        )
+        self._shared_peer_targeted_ids = (
+            shared_peer_targeted_ids
+            if shared_peer_targeted_ids is not None
+            else {}
+        )
         self._workspace_room_transcripts = {"": self._shared_room_transcript}
+        self._workspace_passive_contexts = {"": self._shared_passive_context}
+        self._workspace_peer_targeted_ids = {"": self._shared_peer_targeted_ids}
         self._scopes = {}
         self._send_locks = {}
         self._closed = False
@@ -75,9 +88,6 @@ class GroupchatAddon:
         relevance = dict(settings["relevance"])
         relevance["_legacy_env"] = False
         relevance["filter_model"] = self.filter_model
-        # Reuse the user-editable deterministic acknowledgement rules on
-        # inbound replies to messages addressed to another local agent.
-        relevance["silence_patterns"] = settings["pingpong_guard"]["silence_patterns"]
         if self.platform != "matrix":
             base = Path(relevance["context_file"])
             suffix = f".{self.platform}" + (f".{self.scope}" if self.scope else "")
@@ -91,6 +101,8 @@ class GroupchatAddon:
                 platform=self.platform, dispatch=self._dispatch,
                 own_user_id=self._own_user_id,
                 room_transcript=self._shared_room_transcript,
+                passive_context=self._shared_passive_context,
+                peer_targeted_event_ids=self._shared_peer_targeted_ids,
             )
 
     def bind(self, dispatch):
@@ -153,10 +165,18 @@ class GroupchatAddon:
             room_transcript = self._workspace_room_transcripts.setdefault(
                 str(workspace or ""), {}
             )
+            passive_context = self._workspace_passive_contexts.setdefault(
+                str(workspace or ""), {}
+            )
+            peer_targeted_ids = self._workspace_peer_targeted_ids.setdefault(
+                str(workspace or ""), {}
+            )
             self._scopes[key] = GroupchatAddon(
                 self.adapter,
                 scope=digest,
                 shared_room_transcript=room_transcript,
+                shared_passive_context=passive_context,
+                shared_peer_targeted_ids=peer_targeted_ids,
             )
             self._scopes[key].bind(self._dispatch)
         return self._scopes[key]

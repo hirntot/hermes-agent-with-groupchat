@@ -15,6 +15,14 @@ from plugins.platforms.matrix.intelligent_reaction import (
 )
 
 
+def test_score_parser_preserves_zero_for_discard():
+    score, rationale = IntelligentReactionGate._parse_score(
+        '{"score": 0, "rationale": "Discardable noise."}'
+    )
+    assert score == 0
+    assert rationale == "Discardable noise."
+
+
 class _AdapterStub:
     def __init__(self):
         self.delivered = []
@@ -439,7 +447,6 @@ async def test_matrix_redaction_removes_buffered_original_without_dispatch(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _AdapterStub()
     gate = IntelligentReactionGate(adapter, config=None)
-    gate._score_delays[1] = 3600
     monkeypatch.setattr(gate, "_maybe_update_context", lambda *args, **kwargs: None)
 
     async def _irrelevant(*args, **kwargs):
@@ -450,8 +457,8 @@ async def test_matrix_redaction_removes_buffered_original_without_dispatch(
     original = _event(room, "group", "Projektgruppe", "temporärer Status")
 
     await gate.process(original, is_mentioned=False)
-    assert room in gate._pending
-    assert gate._pending[room].events[0][0].message_id == "$event"
+    assert room in gate._passive_context
+    assert gate._passive_context[room][0][0].message_id == "$event"
 
     redaction = dataclasses.replace(
         _event(
@@ -464,16 +471,15 @@ async def test_matrix_redaction_removes_buffered_original_without_dispatch(
     )
     await gate.process(redaction, is_mentioned=False)
 
-    assert room not in gate._pending
+    assert room not in gate._passive_context
     assert adapter.delivered == []
 
 
 @pytest.mark.asyncio
-async def test_score_one_flushes_after_configured_delay(tmp_path, monkeypatch):
+async def test_score_one_remains_passive_without_timer(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _AdapterStub()
     gate = IntelligentReactionGate(adapter, config=None)
-    gate._score_delays[1] = 0
     monkeypatch.setattr(gate, "_maybe_update_context", lambda *args, **kwargs: None)
 
     async def _irrelevant(*args, **kwargs):
@@ -486,10 +492,29 @@ async def test_score_one_flushes_after_configured_delay(tmp_path, monkeypatch):
         _event(room, "group", "Projektgruppe", "Allgemeine Statusmeldung"),
         is_mentioned=False,
     )
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-
-    assert len(adapter.delivered) == 1
-    assert adapter.delivered[0].text.startswith("Allgemeine Statusmeldung")
-    assert "[Relevance assessment:" in adapter.delivered[0].text
+    assert adapter.delivered == []
     assert room not in gate._pending
+    assert len(gate._passive_context[room]) == 1
+
+
+@pytest.mark.asyncio
+async def test_score_zero_is_discarded_without_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _AdapterStub()
+    gate = IntelligentReactionGate(adapter, config=None)
+    monkeypatch.setattr(gate, "_maybe_update_context", lambda *args, **kwargs: None)
+
+    async def _discard(*args, **kwargs):
+        return 0, "Discardable process noise."
+
+    monkeypatch.setattr(gate, "_throttled_evaluate", _discard)
+    room = "!group:example.org"
+    await gate.process(
+        _event(room, "group", "Projektgruppe", "discard me"),
+        is_mentioned=False,
+    )
+
+    assert adapter.delivered == []
+    assert room not in gate._pending
+    assert room not in gate._passive_context
+    assert room not in gate._room_transcript

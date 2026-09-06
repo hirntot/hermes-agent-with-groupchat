@@ -186,6 +186,22 @@ def test_empty_lists_and_defaults_are_distinct():
     assert empty["pingpong_guard"]["silence_patterns"] == []
 
 
+def test_legacy_score_one_delay_is_removed_from_settings():
+    from plugins.groupchat.config import validate_settings
+
+    settings = validate_settings({
+        "relevance": {
+            "score_delays": {5: 0, 4: 3, 3: 10, 2: 30, 1: 120}
+        }
+    })
+    assert settings["relevance"]["score_delays"] == {
+        5: 0,
+        4: 3,
+        3: 10,
+        2: 30,
+    }
+
+
 @pytest.mark.parametrize("section,key", [("relevance", "system_patterns"),
     ("relevance", "multiline_patterns"), ("pingpong_guard", "silence_patterns")])
 def test_api_rejects_invalid_pattern_without_saving(section, key, tmp_path):
@@ -362,14 +378,14 @@ async def test_plain_peer_name_is_dropped_before_scoring_or_buffering(tmp_path):
     ]
     assert [record["reason_code"] for record in records[-2:]] == [
         "plain_name_addressed_to_peer",
-        "peer_reply_pingpong",
+        "reply_to_peer_targeted_message",
     ]
     assert all(record["explicitly_addressed_elsewhere"] for record in records[-2:])
     await adapter.disconnect()
 
 
 @pytest.mark.asyncio
-async def test_substantive_peer_reply_can_trigger_a_contribution(tmp_path):
+async def test_peer_thread_stays_passive_until_next_open_message(tmp_path):
     adapter = Adapter(Platform.MATRIX, {
         "relevance": {"enabled": True},
         "pingpong_guard": {"enabled": True},
@@ -383,7 +399,7 @@ async def test_substantive_peer_reply_can_trigger_a_contribution(tmp_path):
     await adapter.handle_message(request)
 
     gate._throttled_evaluate = AsyncMock(
-        return_value=(5, "Another agent can add a useful correction.")
+        side_effect=AssertionError("explicit peer thread reached scorer")
     )
     peer_reply = event(
         Platform.MATRIX,
@@ -398,9 +414,65 @@ async def test_substantive_peer_reply_can_trigger_a_contribution(tmp_path):
     peer_reply.metadata["conversation_mentioned"] = False
     await adapter.handle_message(peer_reply)
 
+    assert adapter.delivered == []
+    assert len(gate._passive_context["same-room"]) == 2
+
+    gate._throttled_evaluate = AsyncMock(
+        return_value=(5, "The latest open message invites a useful contribution.")
+    )
+    open_message = event(
+        Platform.MATRIX,
+        text="Could advertising be affected by that compatibility risk?",
+    )
+    open_message.message_id = "open-message"
+    open_message.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(open_message)
+
     assert len(adapter.delivered) == 1
-    assert "compatibility risk" in adapter.delivered[0].text
+    assert adapter.delivered[0].text.startswith("Could advertising")
+    assert "compatibility risk" in (adapter.delivered[0].channel_context or "")
+    assert "same-room" not in gate._passive_context
     gate._throttled_evaluate.assert_awaited_once()
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_each_latest_message_is_scored_separately_with_recent_context(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True},
+        "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().relevance
+    calls = []
+
+    async def score(_room, text, transcript):
+        calls.append((text, transcript))
+        return (5, "Now relevant.") if text == "Advertising implications?" else (1, "Passive context.")
+
+    gate._throttled_evaluate = score
+    for index, text in enumerate((
+        "Social campaign draft one",
+        "Social campaign revision two",
+        "Advertising implications?",
+    )):
+        message = event(Platform.MATRIX, text=text)
+        message.message_id = f"latest-{index}"
+        message.metadata["conversation_mentioned"] = False
+        await adapter.handle_message(message)
+
+    assert [text for text, _ in calls] == [
+        "Social campaign draft one",
+        "Social campaign revision two",
+        "Advertising implications?",
+    ]
+    assert "Social campaign draft one" in calls[1][1]
+    assert "Social campaign revision two" not in calls[1][1]
+    assert "Social campaign draft one" in calls[2][1]
+    assert "Social campaign revision two" in calls[2][1]
+    assert len(adapter.delivered) == 1
+    assert adapter.delivered[0].text.startswith("Advertising implications?")
+    assert "Social campaign draft one" in (adapter.delivered[0].channel_context or "")
+    assert "same-room" not in gate._passive_context
     await adapter.disconnect()
 
 
@@ -427,9 +499,12 @@ async def test_plain_own_name_is_an_immediate_direct_address(tmp_path):
 
 
 def test_agent_name_matching_uses_word_boundaries():
-    pattern = IntelligentReactionGate._names_pattern(["lena", "charlotte ai"])
+    pattern = IntelligentReactionGate._names_pattern(
+        ["lena", "charlotte ai", "charlotte_ai"]
+    )
     assert pattern.search("Lena, bitte übernehmen.")
     assert pattern.search("charlotte ai?")
+    assert pattern.search("@charlotte_ai:example.test bitte prüfen")
     assert not pattern.search("Elena, bitte übernehmen.")
     assert not pattern.search("charlotte_airport")
 
@@ -542,6 +617,11 @@ async def test_thread_lanes_share_clean_room_context_without_merging_queues(
     second = root.for_conversation("same-room", {}, "thread-2")
 
     assert first.relevance._room_transcript is second.relevance._room_transcript
+    assert first.relevance._passive_context is second.relevance._passive_context
+    assert (
+        first.relevance._peer_targeted_event_ids
+        is second.relevance._peer_targeted_event_ids
+    )
     assert first.relevance._pending is not second.relevance._pending
 
     first.relevance._record_transcript(
