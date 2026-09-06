@@ -59,6 +59,7 @@ def _make_audio_event(
     body: str = "Voice message",
     url: str = "mxc://example.org/abc123",
     is_voice: bool = False,
+    filename: str = "",
     mimetype: str = "audio/ogg",
     timestamp: int = 9999999999000,  # ms
 ):
@@ -83,6 +84,8 @@ def _make_audio_event(
 
     if is_voice:
         content["org.matrix.msc3245.voice"] = {}
+    if filename:
+        content["filename"] = filename
 
     event = SimpleNamespace(
         event_id=event_id,
@@ -153,6 +156,48 @@ class TestMatrixVoiceMessageDetection:
         # download_media is called with a ContentURI wrapping the mxc URL
         self.adapter._client.download_media.assert_awaited_once()
         assert captured_event.media_types == ["audio/ogg"]
+
+    @pytest.mark.asyncio
+    async def test_voice_message_filename_without_msc3245_is_voice(self):
+        """Clients may identify a recording only as ``voice_message.m4a``."""
+        event = _make_audio_event(
+            body="",
+            filename="voice_message.m4a",
+            mimetype="audio/mp4",
+        )
+
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._on_room_message(event)
+
+        assert captured_event is not None
+        assert captured_event.message_type == MessageType.VOICE
+        assert captured_event.media_types == ["audio/mp4"]
+
+    @pytest.mark.asyncio
+    async def test_regular_m4a_attachment_remains_audio(self):
+        event = _make_audio_event(
+            body="",
+            filename="meeting-recording.m4a",
+            mimetype="audio/mp4",
+        )
+
+        captured_event = None
+
+        async def capture(msg_event):
+            nonlocal captured_event
+            captured_event = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._on_room_message(event)
+
+        assert captured_event is not None
+        assert captured_event.message_type == MessageType.AUDIO
 
 
 class TestMatrixVoiceCacheFallback:
@@ -263,4 +308,3 @@ class TestMatrixSendVoiceMSC3245:
             os.unlink(temp_path)
             if os.path.exists(converted_path):
                 os.unlink(converted_path)
-

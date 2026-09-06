@@ -70,7 +70,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
-from agent.secret_scope import UnscopedSecretError, get_secret
+from agent.secret_scope import (
+    UnscopedSecretError,
+    build_profile_secret_scope,
+    get_secret,
+    is_multiplex_active,
+)
 
 try:
     from mautrix.types import (
@@ -95,6 +100,8 @@ except ImportError:
     class _EventTypeStub:  # type: ignore[no-redef]
         ROOM_MESSAGE = "m.room.message"
         REACTION = "m.reaction"
+        TYPING = "m.typing"
+        ROOM_REDACTION = "m.room.redaction"
         ROOM_ENCRYPTED = "m.room.encrypted"
         ROOM_NAME = "m.room.name"
 
@@ -138,6 +145,7 @@ from gateway.platforms.base import (
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
 )
+from gateway.session import build_session_key
 from gateway.platforms.helpers import ThreadParticipationTracker
 
 logger = logging.getLogger(__name__)
@@ -560,6 +568,20 @@ class _MatrixChoicePickerPrompt:
     bot_reaction_events: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class _MatrixClarifyPrompt:
+    """Tracks a pending reaction-based ``clarify`` question."""
+
+    chat_id: str
+    message_id: str
+    session_key: str
+    clarify_id: str
+    choices: dict[str, str]  # reaction emoji -> full choice label
+    requester_user_id: str | None = None
+    resolved: bool = False
+    bot_reaction_events: dict[str, str] = field(default_factory=dict)
+
+
 # Matrix message size limit. The spec allows large events (~65 KB), but very
 # large bodies can render poorly in some clients. The previous 4,000-char
 # default was overly conservative and split Markdown tables mid-row (#53026).
@@ -601,6 +623,7 @@ MAX_MESSAGE_LENGTH = DEFAULT_MAX_MESSAGE_LENGTH
 # identities would collide in one crypto.db (#89168). Mirrors the
 # pairing-store fix (a6397c379).
 from hermes_constants import get_hermes_dir as _get_hermes_dir
+from hermes_constants import get_hermes_home as _get_hermes_home
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -654,6 +677,14 @@ _MATRIX_CHOICE_PICKER_REACTIONS = _MATRIX_MODEL_PICKER_REACTIONS + (
     "\U0001f170\ufe0f",  # 🅰️
     "\U0001f171\ufe0f",  # 🅱️
 )
+
+
+def _matrix_clarify_reaction(choice: str, index: int) -> str:
+    """Use a leading semantic emoji, otherwise a stable numeric keycap."""
+    first = str(choice or "").strip().split(maxsplit=1)[0]
+    if first and len(first) <= 8 and not any(ch.isalnum() for ch in first):
+        return first
+    return _MATRIX_CHOICE_PICKER_REACTIONS[index]
 
 _MATRIX_CAPABILITIES: Dict[str, str] = {
     "text": "yes",
@@ -730,6 +761,24 @@ def _looks_like_matrix_media_filename(text: str) -> bool:
     if guessed_type and guessed_type.startswith(("audio/", "video/")):
         return True
     return suffix in _MATRIX_MEDIA_FILENAME_EXTS
+
+
+def _looks_like_matrix_voice_filename(text: str) -> bool:
+    """Recognize clients that label recordings instead of setting MSC3245.
+
+    Some Matrix clients send a recording as plain ``m.audio`` without the
+    ``org.matrix.msc3245.voice`` marker, but retain the semantic filename
+    ``voice_message.<audio extension>``. Keep this deliberately narrow so an
+    arbitrary uploaded M4A/MP3 remains an audio attachment.
+    """
+    candidate = str(text or "").strip()
+    if not candidate or Path(candidate).name != candidate:
+        return False
+    path = Path(candidate)
+    if path.stem.lower().replace("-", "_") != "voice_message":
+        return False
+    guessed_type, _ = mimetypes.guess_type(candidate)
+    return bool(guessed_type and guessed_type.startswith("audio/"))
 
 
 def _matrix_event_timestamp_seconds(event: Any) -> float:
@@ -921,21 +970,32 @@ def _handle_generated_matrix_recovery_key(mxid: str, recovery_key: str) -> None:
 
 
 def _scoped_recovery_key() -> str:
-    """Resolve MATRIX_RECOVERY_KEY honoring the active profile's secret scope.
-
-    Under ``gateway.multiplex_profiles`` the secret scope holds the secondary
-    profile's credentials, while ``os.environ`` may carry the default profile's
-    key — so a bare ``os.getenv`` resolves the wrong key and E2EE verification
-    fails with "Key MAC does not match" (#69090). We read through
-    :func:`get_secret`, which is scope-aware. An *unscoped* read under multiplex
-    (e.g. the default-profile startup loop) raises ``UnscopedSecretError``; in
-    that context ``os.environ`` is that profile's own value, so we fall back to
-    it — mirroring the established Slack app-token pattern (#59739).
-    """
+    """Resolve MATRIX_RECOVERY_KEY without crossing profile scopes."""
     try:
-        return (get_secret("MATRIX_RECOVERY_KEY") or "").strip()
+        value = (get_secret("MATRIX_RECOVERY_KEY") or "").strip()
     except UnscopedSecretError:
-        return os.getenv("MATRIX_RECOVERY_KEY", "").strip()
+        return ""
+    if value or is_multiplex_active():
+        return value
+
+    # Single-profile systemd services intentionally keep profile secrets out of
+    # /proc/<pid>/environ. Read only this service's explicit HERMES_HOME using
+    # the canonical non-mutating Hermes dotenv parser.
+    home = (os.environ.get("HERMES_HOME") or "").strip()
+    if not home:
+        return ""
+    return (
+        build_profile_secret_scope(Path(home)).get("MATRIX_RECOVERY_KEY", "")
+        or ""
+    ).strip()
+
+
+async def _get_own_device_for_signing(olm, user_id, device_id):
+    """Return the own device, fetching fresh server keys when not cached yet."""
+    device = await olm.crypto_store.get_device(user_id, device_id)
+    if device is None:
+        device = await olm.get_or_fetch_device(user_id, device_id)
+    return device
 
 
 def _sanitize_matrix_html(html: str) -> str:
@@ -1104,6 +1164,292 @@ def ensure_matrix_deps() -> bool:
     return True
 
 
+class _IncompleteMatrixKeyShare(RuntimeError):
+    """Raised when a Megolm room key was not shared to every recipient device."""
+
+
+@dataclass(frozen=True)
+class _ActiveE2EEDevice:
+    user_id: str
+    device_id: str
+    sender_key: str
+    seen_at: float
+
+
+def _make_reliable_olm_machine(base_cls: type) -> type:
+    """Wrap mautrix's OlmMachine with Hermes E2EE reliability checks."""
+
+    class _ReliableOlmMachine(base_cls):
+        async def _attach_verified_source_metadata(self, result, event) -> None:
+            """Attach sender-device metadata only after sender-key verification."""
+            sender = getattr(event, "sender", None)
+            sender_key = getattr(event.content, "sender_key", None)
+            if not sender or not sender_key:
+                return
+            try:
+                device = await self.get_or_fetch_device_by_key(sender, sender_key)
+            except Exception as exc:
+                self.log.debug(
+                    "Matrix E2EE: could not resolve verified source device: %s",
+                    exc,
+                )
+                return
+            device_id = getattr(device, "device_id", None) if device else None
+            if not device_id:
+                return
+            try:
+                metadata = result["mautrix"]
+            except (KeyError, TypeError):
+                metadata = {}
+                result["mautrix"] = metadata
+            metadata["source_device_id"] = str(device_id)
+            metadata["source_sender_key"] = str(sender_key)
+
+        async def decrypt_megolm_event(self, event):
+            from mautrix.errors import SessionNotFound
+
+            try:
+                result = await super().decrypt_megolm_event(event)
+            except SessionNotFound:
+                try:
+                    await self._recover_missing_megolm_event(event)
+                except Exception as exc:
+                    self.log.warning(
+                        "Matrix E2EE: failed to start missing-room-key "
+                        "recovery: %s",
+                        exc,
+                    )
+                raise
+            await self._attach_verified_source_metadata(result, event)
+            return result
+
+        def _queue_missing_megolm_retry(self, event) -> None:
+            """Queue one bounded retry task per encrypted event ID."""
+            event_key = str(event.event_id)
+            pending = getattr(self, "_hermes_missing_megolm_events", None)
+            if pending is None:
+                pending = self._hermes_missing_megolm_events = {}
+            existing = pending.get(event_key)
+            if existing is not None and not existing.done():
+                return
+
+            task = asyncio.create_task(self._retry_missing_megolm_event(event))
+            pending[event_key] = task
+
+            def _finished(done_task) -> None:
+                if pending.get(event_key) is done_task:
+                    pending.pop(event_key, None)
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    self.log.warning(
+                        "Matrix E2EE: queued Megolm retry failed: %s",
+                        done_task.exception(),
+                    )
+
+            task.add_done_callback(_finished)
+
+        async def _retry_missing_megolm_event(self, event) -> None:
+            """Wait briefly for a requested room key, then redispatch the event."""
+            from mautrix.errors import SessionNotFound
+
+            for attempt in range(61):
+                has_session = await self.crypto_store.has_group_session(
+                    event.room_id, event.content.session_id
+                )
+                if has_session:
+                    try:
+                        decrypted = await super().decrypt_megolm_event(event)
+                    except SessionNotFound:
+                        pass
+                    except Exception as exc:
+                        self.log.warning(
+                            "Matrix E2EE: retry decrypt failed after room-key "
+                            "arrival: %s",
+                            exc,
+                        )
+                        return
+                    else:
+                        await self._attach_verified_source_metadata(
+                            decrypted, event
+                        )
+                        dispatch_tasks = self.client.dispatch_event(
+                            decrypted, event.source
+                        )
+                        if dispatch_tasks:
+                            await asyncio.gather(*dispatch_tasks)
+                        self.log.info(
+                            "Matrix E2EE: recovered and redispatched event %s",
+                            event.event_id,
+                        )
+                        return
+                if attempt < 60:
+                    await asyncio.sleep(1)
+
+            self.log.warning(
+                "Matrix E2EE: missing room key did not arrive within 60 seconds"
+            )
+
+        async def _recover_missing_megolm_event(self, event) -> None:
+            """Rekey the sender, request the missing room key, and queue a retry."""
+            from uuid import uuid4
+
+            from mautrix.types import (
+                DeviceID,
+                EventType,
+                KeyRequestAction,
+                RequestedKeyInfo,
+                RoomID,
+                RoomKeyRequestEventContent,
+                SessionID,
+                UserID,
+            )
+
+            sender_key = getattr(event.content, "sender_key", None)
+            session_id = getattr(event.content, "session_id", None)
+            algorithm = getattr(event.content, "algorithm", None)
+            if not sender_key or not session_id or not algorithm:
+                self.log.warning(
+                    "Matrix E2EE: cannot request missing room key without "
+                    "sender key, session ID, and algorithm"
+                )
+                return
+
+            self._queue_missing_megolm_retry(event)
+            request_key = (
+                str(event.room_id),
+                str(sender_key),
+                str(session_id),
+            )
+            now = time.monotonic()
+            requests = getattr(self, "_hermes_room_key_requests", None)
+            if requests is None:
+                requests = self._hermes_room_key_requests = {}
+            for key, requested_at in list(requests.items()):
+                if now - requested_at > 300:
+                    requests.pop(key, None)
+            if now - requests.get(request_key, 0) < 60:
+                return
+            requests[request_key] = now
+
+            try:
+                device = await self.get_or_fetch_device_by_key(
+                    event.sender, sender_key
+                )
+                if device is None or not getattr(device, "device_id", None):
+                    raise RuntimeError(
+                        "Missing-key sender device could not be verified"
+                    )
+                verified_device_id = device.device_id
+                if device is not None:
+                    try:
+                        from mautrix.types import Obj
+
+                        await self.send_encrypted_to_device(
+                            device,
+                            EventType.TO_DEVICE_DUMMY,
+                            Obj(),
+                            _force_recreate_session=True,
+                        )
+                    except Exception as exc:
+                        self.log.warning(
+                            "Matrix E2EE: targeted Olm rekey before room-key "
+                            "request failed: %s",
+                            exc,
+                        )
+
+                request = RoomKeyRequestEventContent(
+                    action=KeyRequestAction.REQUEST,
+                    requesting_device_id=DeviceID(self.client.device_id),
+                    request_id=uuid4().hex,
+                    body=RequestedKeyInfo(
+                        algorithm=algorithm,
+                        room_id=RoomID(event.room_id),
+                        sender_key=sender_key,
+                        session_id=SessionID(session_id),
+                    ),
+                )
+                await self.client.send_to_device(
+                    EventType.ROOM_KEY_REQUEST,
+                    {
+                        UserID(event.sender): {
+                            DeviceID(verified_device_id): request
+                        }
+                    },
+                )
+                self.log.info(
+                    "Matrix E2EE: requested missing Megolm room key for %s",
+                    event.room_id,
+                )
+            except Exception as exc:
+                requests.pop(request_key, None)
+                self.log.warning(
+                    "Matrix E2EE: room-key recovery request failed: %s", exc
+                )
+
+        async def _find_olm_sessions(
+            self, session, user_id, device_id, device
+        ):
+            from mautrix.crypto.encrypt_megolm import key_missing
+
+            pending_by_room = getattr(self, "_hermes_pending_key_shares", {})
+            pending = pending_by_room.get(str(session.room_id))
+            if pending is not None:
+                from mautrix.types import EventType, Obj
+
+                # Rekey before the base lookup. The base implementation marks a
+                # recipient as users_shared_with as soon as it finds an Olm
+                # session. Rekeying after that lookup and calling it a second
+                # time returns already_shared, which silently omits the actual
+                # m.room_key from the to-device recipient map.
+                await self.send_encrypted_to_device(
+                    device,
+                    EventType.TO_DEVICE_DUMMY,
+                    Obj(),
+                    _force_recreate_session=True,
+                )
+            result = await super()._find_olm_sessions(
+                session, user_id, device_id, device
+            )
+            if pending is not None:
+                key = (str(user_id), str(device_id))
+                if result is key_missing:
+                    pending.add(key)
+                else:
+                    pending.discard(key)
+            return result
+
+        async def _share_group_session(self, room_id, users):
+            pending_by_room = getattr(self, "_hermes_pending_key_shares", None)
+            if pending_by_room is None:
+                pending_by_room = self._hermes_pending_key_shares = {}
+            room_key = str(room_id)
+            pending_by_room[room_key] = set()
+            try:
+                await super()._share_group_session(room_id, users)
+                unresolved = pending_by_room[room_key]
+                if unresolved:
+                    await self.crypto_store.remove_outbound_group_session(room_id)
+                    raise _IncompleteMatrixKeyShare(
+                        "Megolm key share incomplete for "
+                        f"{len(unresolved)} recipient device(s): "
+                        + ", ".join(
+                            f"{user_id}/{device_id}"
+                            for user_id, device_id in sorted(unresolved)
+                        )
+                    )
+            finally:
+                pending_by_room.pop(room_key, None)
+
+    _ReliableOlmMachine.__name__ = f"Reliable{base_cls.__name__}"
+    return _ReliableOlmMachine
+
+
+def _create_reliable_olm_machine(base_factory, *args, **kwargs):
+    """Instantiate the reliable wrapper for real classes, preserving test factories."""
+    if isinstance(base_factory, type):
+        base_factory = _make_reliable_olm_machine(base_factory)
+    return base_factory(*args, **kwargs)
+
+
 class _CryptoStateStore:
     """Adapter that satisfies the mautrix crypto StateStore interface.
 
@@ -1236,6 +1582,11 @@ class MatrixAdapter(BasePlatformAdapter):
 
         self._client: Any = None  # mautrix.client.Client
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
+        self._active_e2ee_devices: Dict[str, _ActiveE2EEDevice] = {}
+        self._prepared_e2ee_sessions: Dict[tuple[str, str, str, str], str] = {}
+        self._e2ee_send_locks: Dict[str, asyncio.Lock] = {}
+        self._active_reliable_sends: Set[asyncio.Task] = set()
+        self._client_lifecycle_lock = asyncio.Lock()
         self._store_dir: Optional[Path] = None  # pinned per profile in connect()
         self._sync_task: Optional[asyncio.Task] = None
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
@@ -1383,6 +1734,8 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
+        self._clarify_prompts_by_event: Dict[str, _MatrixClarifyPrompt] = {}
+        self._clarify_prompt_by_session: Dict[str, str] = {}
         allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
@@ -1399,6 +1752,9 @@ class MatrixAdapter(BasePlatformAdapter):
                     pattern,
                     exc,
                 )
+
+    def conversation_user_id(self):
+        return str(getattr(self._client, "mxid", "") or "")
 
     def _is_duplicate_event(self, event_id) -> bool:
         """Return True if this event was already processed. Tracks the ID otherwise."""
@@ -1498,14 +1854,13 @@ class MatrixAdapter(BasePlatformAdapter):
     async def _reset_crypto_store_if_device_changed(
         self, crypto_store: Any, device_id: str
     ) -> bool:
-        """Reset the local Olm account when the access token's device changed.
+        """Validate that the token device matches the persisted Olm account.
 
-        The crypto store is keyed by user ID, so a new access token (= new
-        device ID) would otherwise inherit the previous device's Olm account.
-        Its identity keys can never be published under the new device ID
-        (and the pickle key embeds the old device ID anyway), which leads to
-        stale-key mismatches and cross-signing signatures that the
-        homeserver refuses to replace. Returns True if the store was reset.
+        Device rotation is an administrative lifecycle operation: device ID,
+        token and a fresh store must be prepared together while the gateway is
+        stopped.  Automatically deleting the store here can strand a running
+        process on a moved database or recreate identity keys under a reused
+        server device ID.  A mismatch therefore fails closed without mutation.
         """
         if not device_id:
             return False
@@ -1516,15 +1871,15 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
         if not stored_device_id or stored_device_id == device_id:
             return False
-        logger.warning(
-            "Matrix: access token belongs to a new device (%s -> %s) — "
-            "resetting local Olm account so fresh identity keys are "
-            "generated for this device",
-            stored_device_id,
+        logger.error(
+            "Matrix: access-token device %s does not match the persisted "
+            "crypto-store device %s. Refusing E2EE startup without changing "
+            "the store. An administrator must back up the profile and rotate "
+            "device ID, token and store together.",
             device_id,
+            stored_device_id,
         )
-        await crypto_store.delete()
-        return True
+        raise RuntimeError("Matrix crypto-store device mismatch")
 
     async def _migrate_legacy_crypto_pickle(
         self, crypto_store: Any, crypto_db: Any, acct_id: str, pickle_key: str
@@ -1678,7 +2033,7 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.warning("Matrix: device keys missing from server — re-uploading")
             olm.account.shared = False
             try:
-                await olm.share_keys()
+                await asyncio.wait_for(olm.share_keys(), timeout=30)
             except Exception as exc:
                 logger.error("Matrix: failed to re-upload device keys: %s", exc, exc_info=True)
                 return False
@@ -1687,43 +2042,14 @@ class MatrixAdapter(BasePlatformAdapter):
         server_ed25519 = self._extract_server_ed25519(our_keys)
 
         if server_ed25519 != local_ed25519:
-            if olm.account.shared:
-                logger.error(
-                    "Matrix: server has different identity keys for device %s — "
-                    "local crypto state is stale. Delete %s and restart.",
-                    client.device_id,
-                    str(self._crypto_db_path),
-                )
-                return False
-
-            logger.warning(
-                "Matrix: server has stale keys for device %s — attempting re-upload",
+            logger.error(
+                "Matrix: server has different identity keys for device %s. "
+                "Refusing E2EE startup without deleting the device, rotating "
+                "credentials or changing the local store. An administrator "
+                "must preserve evidence and perform a coordinated device/token/store rotation.",
                 client.device_id,
             )
-            try:
-                await client.api.request(
-                    client.api.Method.DELETE
-                    if hasattr(client.api, "Method")
-                    else "DELETE",
-                    f"/_matrix/client/v3/devices/{client.device_id}",
-                )
-                logger.info(
-                    "Matrix: deleted stale device %s from server", client.device_id
-                )
-            except Exception:
-                pass
-            try:
-                await olm.share_keys()
-            except Exception as exc:
-                logger.error(
-                    "Matrix: cannot upload device keys for %s: %s. "
-                    "Try generating a new access token to get a fresh device.",
-                    client.device_id,
-                    exc,
-                    exc_info=True,
-                )
-                return False
-            return await self._reverify_keys_after_upload(client, local_ed25519)
+            return False
 
         return True
 
@@ -1732,11 +2058,17 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Serialize Matrix client creation against disconnect/reconnect."""
+        async with self._client_lifecycle_lock:
+            return await self._connect_unlocked(is_reconnect=is_reconnect)
+
+    async def _connect_unlocked(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the Matrix homeserver and start syncing."""
+        self._closing = True
         self._device_id_unverified = False
         if self._client is not None:
             try:
-                await self.disconnect()
+                await self._disconnect_unlocked()
             except Exception as exc:
                 logger.warning("Matrix: error disconnecting before reconnect: %s", exc)
 
@@ -1861,8 +2193,11 @@ class MatrixAdapter(BasePlatformAdapter):
                 return False
         elif self._password and self._user_id:
             try:
+                _login_identifier = self._user_id
+                if _login_identifier.startswith("@") and ":" in _login_identifier:
+                    _login_identifier = _login_identifier[1:].split(":", 1)[0]
                 resp = await client.login(
-                    identifier=self._user_id,
+                    identifier=_login_identifier,
                     password=self._password,
                     device_name="Hermes Agent",
                     device_id=self._device_id or None,
@@ -1977,7 +2312,9 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
 
                     crypto_state = _CryptoStateStore(state_store, self._joined_rooms, client)
-                    olm = OlmMachine(client, crypto_store, crypto_state)
+                    olm = _create_reliable_olm_machine(
+                        OlmMachine, client, crypto_store, crypto_state
+                    )
                     olm.share_keys_min_trust = TrustState.UNVERIFIED
                     olm.send_keys_min_trust = TrustState.UNVERIFIED
 
@@ -1989,7 +2326,7 @@ class MatrixAdapter(BasePlatformAdapter):
                         return False
 
                     try:
-                        await olm.share_keys()
+                        await asyncio.wait_for(olm.share_keys(), timeout=30)
                     except Exception as exc:
                         exc_str = str(exc)
                         if "already exists" in exc_str:
@@ -2016,13 +2353,26 @@ class MatrixAdapter(BasePlatformAdapter):
                             logger.info("Matrix: cross-signing verified via recovery key")
                         except Exception as exc:
                             logger.warning("Matrix: recovery key verification failed: %s", exc)
+                        try:
+                            own_device = await _get_own_device_for_signing(
+                                olm,
+                                client.mxid,
+                                client.device_id,
+                            )
+                            if own_device:
+                                await olm.sign_own_device(own_device)
+                                logger.info("Matrix: signed own device %s via recovery key", client.device_id)
+                            else:
+                                logger.warning("Matrix: could not get own device to sign")
+                        except Exception as exc:
+                            logger.warning("Matrix: signing own device with recovery key failed: %s", exc)
                     else:
                         try:
                             own_xsign = await olm.get_own_cross_signing_public_keys()
                         except Exception as exc:
                             own_xsign = None
                             logger.warning("Matrix: cross-signing key lookup failed: %s", exc)
-                        if own_xsign is None:
+                        if not own_xsign:
                             _, output_error = _get_matrix_recovery_key_output_target()
                             if output_error == "not_configured":
                                 logger.warning(
@@ -2061,6 +2411,10 @@ class MatrixAdapter(BasePlatformAdapter):
                                         exc,
                                     )
 
+                    try:
+                        await asyncio.wait_for(olm.share_keys(), timeout=30)
+                    except Exception as exc:
+                        logger.warning("Matrix: post-verify share_keys() warning: %s", exc)
                     client.crypto = olm
                     logger.info(
                         "Matrix: E2EE enabled (store: %s%s)",
@@ -2103,6 +2457,16 @@ class MatrixAdapter(BasePlatformAdapter):
             wait_sync=True,
         )
         client.add_event_handler(
+            EventType.TYPING,
+            self._on_typing,
+            wait_sync=True,
+        )
+        client.add_event_handler(
+            EventType.ROOM_REDACTION,
+            self._on_redaction,
+            wait_sync=True,
+        )
+        client.add_event_handler(
             IntEvt.INVITE,
             self._on_invite,
             wait_sync=True,
@@ -2115,8 +2479,6 @@ class MatrixAdapter(BasePlatformAdapter):
         self._late_grace_drops = 0
         self._late_grace_skew = 0.0
         self._clock_skew_warned = False
-        self._closing = False
-
         try:
             sync_data = await client.sync(timeout=10000, full_state=True)
             if isinstance(sync_data, dict):
@@ -2141,7 +2503,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 # Dispatch events from the initial sync so the OlmMachine
                 # receives to-device key shares queued while we were offline.
                 try:
-                    await self._dispatch_sync(sync_data)
+                    await self._dispatch_sync(sync_data, client)
                 except Exception as exc:
                     logger.warning("Matrix: initial sync event dispatch error: %s", exc)
                 self._schedule_pending_invite_joins(sync_data)
@@ -2156,20 +2518,38 @@ class MatrixAdapter(BasePlatformAdapter):
         # Share keys after initial sync if E2EE is enabled.
         if self._encryption and getattr(client, "crypto", None):
             try:
-                await client.crypto.share_keys()
+                await asyncio.wait_for(client.crypto.share_keys(), timeout=30)
             except Exception as exc:
                 logger.warning("Matrix: initial key share failed: %s", exc)
 
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
+        self._closing = False
         self._mark_connected()
         # Plugin-registered native handlers (Matrix client — event callbacks).
         self._wire_plugin_handlers(self._client)
         return True
 
     async def disconnect(self) -> None:
+        """Serialize Matrix shutdown against connect/reconnect."""
+        async with self._client_lifecycle_lock:
+            await self._disconnect_unlocked()
+
+    async def _disconnect_unlocked(self) -> None:
         """Disconnect from Matrix."""
         self._closing = True
+
+        current_task = asyncio.current_task()
+        send_tasks = [
+            task
+            for task in self._active_reliable_sends
+            if task is not current_task and not task.done()
+        ]
+        for task in send_tasks:
+            task.cancel()
+        if send_tasks:
+            await asyncio.gather(*send_tasks, return_exceptions=True)
+        self._active_reliable_sends.difference_update(send_tasks)
 
         if self._sync_task and not self._sync_task.done():
             self._sync_task.cancel()
@@ -2194,6 +2574,27 @@ class MatrixAdapter(BasePlatformAdapter):
             await asyncio.gather(*redaction_tasks, return_exceptions=True)
         self._reaction_redaction_tasks.clear()
 
+        crypto = getattr(self._client, "crypto", None) if self._client else None
+        pending_megolm = (
+            getattr(crypto, "_hermes_missing_megolm_events", {})
+            if crypto is not None
+            else {}
+        )
+        recovery_tasks = list(pending_megolm.values())
+        for task in recovery_tasks:
+            if not task.done():
+                task.cancel()
+        if recovery_tasks:
+            await asyncio.gather(*recovery_tasks, return_exceptions=True)
+        pending_megolm.clear()
+        if crypto is not None:
+            getattr(crypto, "_hermes_room_key_requests", {}).clear()
+        self._active_e2ee_devices.clear()
+        self._prepared_e2ee_sessions.clear()
+
+        # Keep per-room send locks across reconnects. A send that still owns
+        # the old lock must remain the serialization boundary for a new send.
+
         # Close the SQLite crypto store database.
         if hasattr(self, "_crypto_db") and self._crypto_db:
             try:
@@ -2210,6 +2611,146 @@ class MatrixAdapter(BasePlatformAdapter):
 
         logger.info("Matrix: disconnected")
 
+    async def _prepare_outbound_e2ee(
+        self, room_id: str, client: Any = None
+    ) -> Optional[_ActiveE2EEDevice]:
+        """Rekey a recent DM device and return the verified device snapshot."""
+        client = self._client if client is None else client
+        if not self._encryption or client is None:
+            return
+        crypto = getattr(client, "crypto", None)
+        if crypto is None:
+            return
+        session = await crypto.crypto_store.get_outbound_group_session(room_id)
+        if (
+            session is not None
+            and session.shared
+            and not session.expired
+            and int(getattr(session, "message_count", 0)) >= 32
+        ):
+            # Matrix has no recipient acknowledgement for Megolm room keys.
+            # Rotate independently of inbound activity: lifecycle notices and
+            # other gateway-originated sends must heal a wedged recipient too.
+            await crypto.crypto_store.remove_outbound_group_session(room_id)
+            session = None
+
+        active = self._active_e2ee_devices.get(room_id)
+        if active is None:
+            return
+        if time.time() - active.seen_at > 3600:
+            self._active_e2ee_devices.pop(room_id, None)
+            return
+        try:
+            is_dm = await self._is_dm_room(room_id)
+        except Exception as exc:
+            raise _IncompleteMatrixKeyShare(
+                f"Could not verify whether active E2EE room is a DM: {exc}"
+            )
+        if not is_dm:
+            return
+
+        if session is None:
+            session = await crypto.crypto_store.get_outbound_group_session(room_id)
+        session_key = (
+            room_id,
+            active.user_id,
+            active.device_id,
+            active.sender_key,
+        )
+        session_id = str(getattr(session, "id", "")) if session else ""
+        session_is_current = bool(
+            session is not None and session.shared and not session.expired
+        )
+        if (
+            session_is_current
+            and session_id
+            and self._prepared_e2ee_sessions.get(session_key) == session_id
+        ):
+            return active
+
+        device = await crypto.crypto_store.get_device(active.user_id, active.device_id)
+        if device is None or str(device.identity_key) != active.sender_key:
+            device = await crypto.get_or_fetch_device_by_key(
+                active.user_id, active.sender_key
+            )
+        if device is None or str(device.device_id) != active.device_id:
+            raise _IncompleteMatrixKeyShare(
+                "Recent active Matrix device is unavailable for E2EE rekey"
+            )
+
+        from mautrix.types import EventType, Obj
+
+        logger.info(
+            "Matrix E2EE: recreating Olm session for recent active DM device "
+            "before Megolm share in %s",
+            room_id,
+        )
+        await crypto.send_encrypted_to_device(
+            device,
+            EventType.TO_DEVICE_DUMMY,
+            Obj(),
+            _force_recreate_session=True,
+        )
+        if session_is_current:
+            await crypto.crypto_store.remove_outbound_group_session(room_id)
+        self._prepared_e2ee_sessions.pop(session_key, None)
+        return active
+
+    async def _mark_outbound_e2ee_prepared(
+        self, room_id: str, active: Optional[_ActiveE2EEDevice], client: Any = None
+    ) -> None:
+        """Remember the Megolm session created after a successful preflight."""
+        client = self._client if client is None else client
+        if not self._encryption or client is None:
+            return
+        crypto = getattr(client, "crypto", None)
+        if active is None or crypto is None:
+            return
+        session = await crypto.crypto_store.get_outbound_group_session(room_id)
+        session_id = str(getattr(session, "id", "")) if session else ""
+        if not session_id or not session.shared or session.expired:
+            return
+        self._prepared_e2ee_sessions[
+            (room_id, active.user_id, active.device_id, active.sender_key)
+        ] = session_id
+
+    async def _send_reliable_event(
+        self, room_id: str, event_type: Any, content: Any, *, timeout: float = 45
+    ) -> Any:
+        """Run the E2EE preflight before any potentially encrypted room event."""
+        if self._closing:
+            raise RuntimeError("Matrix client lifecycle transition in progress")
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_reliable_sends.add(task)
+        try:
+            lock = self._e2ee_send_locks.setdefault(room_id, asyncio.Lock())
+            async with lock:
+                client = self._client
+                if self._closing or client is None:
+                    raise RuntimeError("Matrix client is not available for send")
+                active = await asyncio.wait_for(
+                    self._prepare_outbound_e2ee(room_id, client), timeout=30
+                )
+                if self._closing or self._client is not client:
+                    raise RuntimeError("Matrix client changed during E2EE preflight")
+                event_id = await asyncio.wait_for(
+                    client.send_message_event(RoomID(room_id), event_type, content),
+                    timeout=timeout,
+                )
+                try:
+                    await self._mark_outbound_e2ee_prepared(room_id, active, client)
+                except Exception as marker_exc:
+                    logger.warning(
+                        "Matrix E2EE: could not mark prepared Megolm session for %s: %s",
+                        room_id,
+                        marker_exc,
+                    )
+                return event_id
+        finally:
+            if task is not None:
+                self._active_reliable_sends.discard(task)
+
     async def send(
         self,
         chat_id: str,
@@ -2217,10 +2758,68 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message to a Matrix room."""
+        """Send a message through the room-serialized reliability path."""
+        return await self._send_reliable_text(
+            chat_id, content, reply_to, metadata
+        )
+
+    async def _send_reliable_text(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        if self._closing:
+            return SendResult(
+                success=False, error="Matrix client lifecycle transition in progress"
+            )
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_reliable_sends.add(task)
+        try:
+            lock = self._e2ee_send_locks.setdefault(chat_id, asyncio.Lock())
+            async with lock:
+                client = self._client
+                if self._closing or client is None:
+                    return SendResult(success=False, error="Matrix client unavailable")
+                return await self._send_text_unlocked(
+                    chat_id, content, reply_to, metadata, client=client
+                )
+        finally:
+            if task is not None:
+                self._active_reliable_sends.discard(task)
+
+    async def _send_text_unlocked(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        client: Any = None,
+    ) -> SendResult:
+        """Send text after the caller has acquired the per-room send lock."""
+
+        client = self._client if client is None else client
 
         if not content:
             return SendResult(success=True)
+
+        try:
+            active = await asyncio.wait_for(
+                self._prepare_outbound_e2ee(chat_id, client), timeout=30
+            )
+        except Exception as exc:
+            logger.error(
+                "Matrix E2EE: targeted pre-send recovery failed for %s: %s",
+                chat_id,
+                exc,
+            )
+            return SendResult(success=False, error=str(exc))
+        if self._closing or self._client is not client:
+            return SendResult(
+                success=False, error="Matrix client changed during E2EE preflight"
+            )
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
@@ -2233,7 +2832,7 @@ class MatrixAdapter(BasePlatformAdapter):
 
             try:
                 event_id = await asyncio.wait_for(
-                    self._client.send_message_event(
+                    client.send_message_event(
                         RoomID(chat_id),
                         EventType.ROOM_MESSAGE,
                         msg_content,
@@ -2241,14 +2840,27 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=45,
                 )
                 last_event_id = str(event_id)
+                try:
+                    await self._mark_outbound_e2ee_prepared(chat_id, active, client)
+                except Exception as marker_exc:
+                    logger.warning(
+                        "Matrix E2EE: could not mark prepared Megolm session "
+                        "for %s: %s",
+                        chat_id,
+                        marker_exc,
+                    )
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
                 # On E2EE errors, retry after sharing keys.
-                if self._encryption and getattr(self._client, "crypto", None):
+                if self._encryption and getattr(client, "crypto", None):
                     try:
-                        await self._client.crypto.share_keys()
+                        if self._closing or self._client is not client:
+                            raise RuntimeError("Matrix client changed before E2EE retry")
+                        await asyncio.wait_for(client.crypto.share_keys(), timeout=30)
+                        if self._closing or self._client is not client:
+                            raise RuntimeError("Matrix client changed during E2EE retry")
                         event_id = await asyncio.wait_for(
-                            self._client.send_message_event(
+                            client.send_message_event(
                                 RoomID(chat_id),
                                 EventType.ROOM_MESSAGE,
                                 msg_content,
@@ -2256,6 +2868,17 @@ class MatrixAdapter(BasePlatformAdapter):
                             timeout=45,
                         )
                         last_event_id = str(event_id)
+                        try:
+                            await self._mark_outbound_e2ee_prepared(
+                                chat_id, active, client
+                            )
+                        except Exception as marker_exc:
+                            logger.warning(
+                                "Matrix E2EE: could not mark prepared Megolm "
+                                "session for %s: %s",
+                                chat_id,
+                                marker_exc,
+                            )
                         logger.info(
                             "Matrix: sent event %s to %s (after key share)",
                             last_event_id,
@@ -2375,10 +2998,8 @@ class MatrixAdapter(BasePlatformAdapter):
         }
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
-                EventType.ROOM_MESSAGE,
-                msg_content,
+            event_id = await self._send_reliable_event(
+                chat_id, EventType.ROOM_MESSAGE, msg_content
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
@@ -2739,6 +3360,74 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return result
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list[str]],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a clarify question as persistent, clickable Matrix reactions."""
+        if not choices:
+            return await super().send_clarify(
+                chat_id=chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=metadata,
+            )
+
+        reaction_choices: dict[str, str] = {}
+        lines = [question, "", "Zum Auswählen einfach auf eine Reaktion tippen:"]
+        for index, raw_choice in enumerate(choices):
+            choice = str(raw_choice).strip()
+            emoji = _matrix_clarify_reaction(choice, index)
+            if emoji in reaction_choices:
+                emoji = _MATRIX_CHOICE_PICKER_REACTIONS[index]
+            reaction_choices[emoji] = choice
+            label = choice[len(emoji):].strip() if choice.startswith(emoji) else choice
+            lines.append(f"{emoji} {label}")
+
+        result = await self.send(chat_id, "\n".join(lines), metadata=metadata)
+        if not result.success or not result.message_id:
+            return result
+
+        prompt = _MatrixClarifyPrompt(
+            chat_id=chat_id,
+            message_id=result.message_id,
+            session_key=session_key,
+            clarify_id=clarify_id,
+            choices=reaction_choices,
+            requester_user_id=str((metadata or {}).get("requester_user_id") or "") or None,
+        )
+        old_event = self._clarify_prompt_by_session.get(session_key)
+        if old_event:
+            self._clarify_prompts_by_event.pop(old_event, None)
+        self._clarify_prompts_by_event[result.message_id] = prompt
+        self._clarify_prompt_by_session[session_key] = result.message_id
+
+        # Matrix users may still type a free-form answer instead of reacting.
+        try:
+            from tools.clarify_gateway import mark_awaiting_text
+
+            mark_awaiting_text(clarify_id)
+        except Exception:
+            logger.debug("Matrix: failed to enable clarify text fallback", exc_info=True)
+
+        for emoji in reaction_choices:
+            try:
+                reaction_event_id = await self._send_reaction(
+                    chat_id, result.message_id, emoji
+                )
+                if reaction_event_id:
+                    prompt.bot_reaction_events[emoji] = str(reaction_event_id)
+            except Exception as exc:
+                logger.debug("Matrix: failed to add clarify reaction %s: %s", emoji, exc)
+        return result
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -2973,10 +3662,8 @@ class MatrixAdapter(BasePlatformAdapter):
         self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(room_id),
-                EventType.ROOM_MESSAGE,
-                msg_content,
+            event_id = await self._send_reliable_event(
+                room_id, EventType.ROOM_MESSAGE, msg_content
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
@@ -3123,9 +3810,11 @@ class MatrixAdapter(BasePlatformAdapter):
     # Event callbacks
     # ------------------------------------------------------------------
 
-    async def _dispatch_sync(self, sync_data: Dict[str, Any]) -> None:
+    async def _dispatch_sync(
+        self, sync_data: Dict[str, Any], client: Any = None
+    ) -> None:
         """Dispatch a sync response through the mautrix event machinery."""
-        client = self._client
+        client = self._client if client is None else client
         if not client or not hasattr(client, "handle_sync"):
             return
         tasks = client.handle_sync(sync_data)
@@ -3228,6 +3917,27 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             return False
 
+    def _remember_active_e2ee_device(
+        self, room_id: str, sender: str, event: Any
+    ) -> None:
+        """Remember the real sender device from a successfully decrypted event."""
+        try:
+            metadata = event["mautrix"]
+        except (KeyError, TypeError, AttributeError):
+            return
+        if not isinstance(metadata, dict) or not metadata.get("was_encrypted"):
+            return
+        device_id = str(metadata.get("source_device_id") or "")
+        sender_key = str(metadata.get("source_sender_key") or "")
+        if not room_id or not sender or not device_id or not sender_key:
+            return
+        self._active_e2ee_devices[room_id] = _ActiveE2EEDevice(
+            user_id=sender,
+            device_id=device_id,
+            sender_key=sender_key,
+            seen_at=time.time(),
+        )
+
     async def _on_room_message(self, event: Any) -> None:
         """Handle incoming room message events (text, media)."""
         room_id = str(getattr(event, "room_id", ""))
@@ -3326,6 +4036,8 @@ class MatrixAdapter(BasePlatformAdapter):
                         self._clock_skew_warned = True
             return
 
+        self._remember_active_e2ee_device(room_id, sender, event)
+
         # Extract content from the event.
         content = getattr(event, "content", None)
         if content is None:
@@ -3349,9 +4061,23 @@ class MatrixAdapter(BasePlatformAdapter):
 
         relates_to = source_content.get("m.relates_to", {})
 
-        # Skip edits (m.replace relation).
+        # Handle edits (m.replace relation): dispatch the new content as a new
+        # message, tagged with the original event ID so downstream code can update
+        # context accordingly.
         if relates_to.get("rel_type") == "m.replace":
-            return
+            new_content = source_content.get("m.new_content", {})
+            if new_content:
+                original_event_id = relates_to.get("event_id", event_id)
+                source_content = dict(new_content)
+                source_content["body"] = (
+                    f"[EDIT:{original_event_id}] "
+                    + (source_content.get("body", "") or "")
+                )
+                source_content["m.relates_to"] = {}
+                msgtype = str(source_content.get("msgtype", "m.text"))
+                relates_to = {}
+            else:
+                return
 
         # Ignore m.notice to prevent bot-to-bot loops (m.notice is the
         # conventional msgtype for bot responses in the Matrix ecosystem).
@@ -3483,9 +4209,11 @@ class MatrixAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
-        self._background_read_receipt(room_id, event_id)
+        is_text_msgtype = source_content.get("msgtype") in ("m.text", "m.notice")
+        if not (self.conversation_middleware().delays_messages and is_text_msgtype and not is_dm and not is_mentioned):
+            self._background_read_receipt(room_id, event_id)
 
-        return body, is_dm, chat_type, thread_id, display_name, source
+        return body, is_dm, chat_type, thread_id, display_name, source, is_mentioned
 
     async def _handle_text_message(
         self,
@@ -3512,7 +4240,7 @@ class MatrixAdapter(BasePlatformAdapter):
         )
         if ctx is None:
             return
-        body, is_dm, chat_type, thread_id, display_name, source = ctx
+        body, is_dm, chat_type, thread_id, display_name, source, is_mentioned = ctx
 
         # Reply-to detection.
         reply_to = None
@@ -3566,7 +4294,10 @@ class MatrixAdapter(BasePlatformAdapter):
             user_name=display_name,
         )
 
-        if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
+        if self.conversation_middleware().delays_messages:
+            msg_event.metadata["conversation_mentioned"] = is_mentioned
+            await self.handle_message(msg_event)
+        elif msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
             self._enqueue_text_event(msg_event)
         else:
             await self.handle_message(msg_event)
@@ -3640,7 +4371,10 @@ class MatrixAdapter(BasePlatformAdapter):
             msg_type = MessageType.PHOTO
             media_type = event_mimetype or "image/png"
         elif msgtype == "m.audio":
-            if source_content.get("org.matrix.msc3245.voice") is not None:
+            if (
+                source_content.get("org.matrix.msc3245.voice") is not None
+                or _looks_like_matrix_voice_filename(source_content.get("filename", ""))
+            ):
                 is_voice_message = True
                 msg_type = MessageType.VOICE
             else:
@@ -3750,7 +4484,7 @@ class MatrixAdapter(BasePlatformAdapter):
         )
         if ctx is None:
             return
-        body, is_dm, chat_type, thread_id, display_name, source = ctx
+        body, is_dm, chat_type, thread_id, display_name, source, is_mentioned = ctx
 
         # Reply-to detection (mirrors _handle_text_message).
         reply_to = None
@@ -3799,7 +4533,71 @@ class MatrixAdapter(BasePlatformAdapter):
             user_name=display_name,
         )
 
-        await self.handle_message(msg_event)
+        if self.conversation_middleware().delays_messages and msg_type in {MessageType.AUDIO, MessageType.VOICE}:
+            msg_event.metadata["conversation_mentioned"] = is_mentioned
+            await self.handle_message(msg_event)
+        else:
+            await self.handle_message(msg_event)
+
+
+    async def _on_redaction(self, event: Any) -> None:
+        """Handle incoming Matrix redaction events as deletion notices."""
+        room_id = str(getattr(event, "room_id", ""))
+        sender = str(getattr(event, "sender", ""))
+        if self._is_self_sender(sender):
+            return
+        if not await self._is_allowed_matrix_room_event(room_id):
+            return
+        event_id = str(getattr(event, "event_id", ""))
+        if self._is_duplicate_event(event_id):
+            return
+        event_ts = _matrix_event_timestamp_seconds(event)
+        if event_ts and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
+            return
+        redacts = str(getattr(event, "redacts", ""))
+        if not redacts:
+            return
+        source_content = {
+            "msgtype": "m.text",
+            "body": f"[DELETE:{redacts}] Nachricht gelöscht",
+        }
+        await self._handle_text_message(
+            room_id, sender, event_id, event_ts or time.time(), source_content, {}
+        )
+
+    def _is_inviter_authorized(self, inviter: str) -> bool:
+        """Return whether an inviter may make this bot join any room."""
+
+        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+            "true",
+            "1",
+            "yes",
+        }
+        return allow_all or bool(
+            self._allowed_user_ids and inviter in self._allowed_user_ids
+        )
+
+    def _pending_invite_sender(self, invite_data: Any) -> str:
+        """Extract this bot's inviter from a ``rooms.invite`` state block."""
+
+        if not isinstance(invite_data, dict):
+            return ""
+        invite_state = invite_data.get("invite_state", {})
+        events = invite_state.get("events", []) if isinstance(invite_state, dict) else []
+        if not isinstance(events, list):
+            return ""
+        expected_user_id = str(self.config.extra.get("user_id", ""))
+        for event in reversed(events):
+            if not isinstance(event, dict) or event.get("type") != "m.room.member":
+                continue
+            content = event.get("content", {})
+            if not isinstance(content, dict) or content.get("membership") != "invite":
+                continue
+            state_key = str(event.get("state_key", ""))
+            if expected_user_id and state_key and state_key != expected_user_id:
+                continue
+            return str(event.get("sender", ""))
+        return ""
 
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""
@@ -3811,16 +4609,10 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Only auto-join when the inviter is authorized. Without this, any
         # federated Matrix user could invite the bot into arbitrary rooms,
-        # exposing its presence and metadata. Mirrors the allow-list gate
-        # used on the message/reaction paths.
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
-        if not allow_all and not (
-            self._allowed_user_ids and inviter in self._allowed_user_ids
-        ):
+        # exposing its presence and metadata. The pending-invite reconciliation
+        # path below must use this same decision and fail closed when the sender
+        # cannot be recovered.
+        if not self._is_inviter_authorized(inviter):
             logger.warning(
                 "Matrix: rejecting invite to %s from unauthorized user %s",
                 room_id,
@@ -3905,13 +4697,23 @@ class MatrixAdapter(BasePlatformAdapter):
         self._invite_join_tasks[room_id] = asyncio.create_task(_join_invite())
 
     def _schedule_pending_invite_joins(self, sync_data: Dict[str, Any]) -> None:
-        """Join rooms still present in rooms.invite after sync processing."""
+        """Safely reconcile rooms still present in ``rooms.invite``."""
+
         rooms = sync_data.get("rooms", {}) if isinstance(sync_data, dict) else {}
         invites = rooms.get("invite", {})
         if not isinstance(invites, dict):
             return
-        for room_id in invites:
+        for room_id, invite_data in invites.items():
             if room_id in self._joined_rooms:
+                continue
+            inviter = self._pending_invite_sender(invite_data)
+            if not self._is_inviter_authorized(inviter):
+                logger.warning(
+                    "Matrix: not reconciling pending invite for %s from "
+                    "unauthorized or unknown user %s",
+                    room_id,
+                    inviter or "<unknown>",
+                )
                 continue
             logger.info("Matrix: reconciling pending invite for %s", room_id)
             self._schedule_invite_join(str(room_id))
@@ -3940,6 +4742,9 @@ class MatrixAdapter(BasePlatformAdapter):
             }
         }
         try:
+            # mautrix 0.21.0 explicitly blacklists reactions from room-event
+            # encryption. Running the Megolm preflight here would consume an
+            # Olm OTK and rotate a group session that this event cannot share.
             resp_event_id = await self._client.send_message_event(
                 RoomID(room_id),
                 EventType.REACTION,
@@ -3989,8 +4794,19 @@ class MatrixAdapter(BasePlatformAdapter):
         self._reaction_redaction_tasks.add(task)
         task.add_done_callback(self._reaction_redaction_tasks.discard)
 
+    def _relevance_audit_session_id(self, event: MessageEvent) -> str:
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add eyes reaction when the agent starts processing a message."""
+        """Audit turn start and optionally add an eyes reaction."""
         if not self._reactions_enabled:
             return
         msg_id = event.message_id
@@ -4005,7 +4821,7 @@ class MatrixAdapter(BasePlatformAdapter):
         event: MessageEvent,
         outcome: ProcessingOutcome,
     ) -> None:
-        """Replace eyes with checkmark (success) or cross (failure)."""
+        """Audit turn completion and optionally update the reaction."""
         if not self._reactions_enabled:
             return
         msg_id = event.message_id
@@ -4027,6 +4843,18 @@ class MatrixAdapter(BasePlatformAdapter):
             msg_id,
             "\u2705" if outcome == ProcessingOutcome.SUCCESS else "\u274c",
         )
+
+    async def _on_typing(self, event: Any) -> None:
+        if not self.conversation_middleware().delays_messages:
+            return
+        room = str(event.room_id)
+        content = event.content or {}
+        users = content.get("user_ids", [])
+        if not users:
+            return
+        if self._client and all(u == self._client.mxid for u in users):
+            return
+        self.conversation_middleware().typing(room)
 
     async def _on_reaction(self, event: Any) -> None:
         """Handle incoming reaction events."""
@@ -4060,6 +4888,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 reacts_to,
                 room_id,
             )
+            try:
+                from gateway.matrix_outbox import record_reaction
+                record_reaction(
+                    room_id=room_id, event_id=event_id, sender=sender,
+                    target_event_id=str(reacts_to), key=str(key),
+                )
+            except Exception:
+                logger.exception("Matrix: failed to persist automation reaction %s", event_id)
 
             # Check if this reaction resolves a pending approval prompt.
             prompt = self._approval_prompts_by_event.get(reacts_to)
@@ -4098,6 +4934,57 @@ class MatrixAdapter(BasePlatformAdapter):
                         await self._redact_bot_approval_reactions(room_id, prompt)
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Matrix reaction: %s", exc)
+                return
+
+            clarify_prompt = self._clarify_prompts_by_event.get(reacts_to)
+            if clarify_prompt and not clarify_prompt.resolved:
+                if room_id != clarify_prompt.chat_id:
+                    return
+                if not await self._validate_matrix_prompt_reactor(
+                    room_id, reacts_to, sender, clarify_prompt, "clarify prompt"
+                ):
+                    return
+                response = clarify_prompt.choices.get(key)
+                if response is None:
+                    await self._send_invalid_reaction_feedback(
+                        room_id,
+                        reacts_to,
+                        "Diese Reaktion gehört nicht zu den angebotenen Möglichkeiten.",
+                    )
+                    return
+                try:
+                    from tools.clarify_gateway import resolve_gateway_clarify
+
+                    resolved = resolve_gateway_clarify(
+                        clarify_prompt.clarify_id, response
+                    )
+                    if resolved:
+                        clarify_prompt.resolved = True
+                        self._clarify_prompts_by_event.pop(reacts_to, None)
+                        self._clarify_prompt_by_session.pop(
+                            clarify_prompt.session_key, None
+                        )
+                        for emoji, seed_event_id in (
+                            clarify_prompt.bot_reaction_events.items()
+                        ):
+                            self._schedule_reaction_redaction(
+                                room_id, seed_event_id, "clarify resolved"
+                            )
+                            logger.debug(
+                                "Matrix: scheduled clarify seed reaction redaction %s (%s)",
+                                emoji,
+                                seed_event_id,
+                            )
+                    else:
+                        self._clarify_prompts_by_event.pop(reacts_to, None)
+                        self._clarify_prompt_by_session.pop(
+                            clarify_prompt.session_key, None
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to resolve clarify prompt from Matrix reaction: %s",
+                        exc,
+                    )
                 return
 
             model_prompt = self._model_picker_prompts_by_event.get(reacts_to)
@@ -4576,10 +5463,8 @@ class MatrixAdapter(BasePlatformAdapter):
         msg_content = self._build_text_message_content(text, msgtype=msgtype)
 
         try:
-            event_id = await self._client.send_message_event(
-                RoomID(chat_id),
-                EventType.ROOM_MESSAGE,
-                msg_content,
+            event_id = await self._send_reliable_event(
+                chat_id, EventType.ROOM_MESSAGE, msg_content
             )
             return SendResult(success=True, message_id=str(event_id))
         except Exception as exc:
@@ -5395,12 +6280,14 @@ def interactive_setup() -> None:
 
 
 def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
-    """Translate config.yaml matrix: keys into MATRIX_* env vars.
+    """Translate config.yaml Matrix keys into runtime settings.
 
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
-    matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+    Scalar legacy settings continue through MATRIX_* environment bridges.
+    Structured room ACLs are returned as profile-local ``PlatformConfig.extra``
+    data so multiplexed profiles cannot inherit another profile's first-writer
+    process environment.
     """
+    seeded: dict = {}
     if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
     au = matrix_cfg.get("allowed_users")
@@ -5418,6 +6305,9 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         if isinstance(ar, list):
             ar = ",".join(str(v) for v in ar)
         os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
+    groups = matrix_cfg.get("groups")
+    if isinstance(groups, dict):
+        seeded["groups"] = groups
     ignore_patterns = matrix_cfg.get("ignore_user_patterns")
     if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
         if isinstance(ignore_patterns, list):
@@ -5433,7 +6323,18 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
-    return None
+
+    # Intelligent reaction settings from config.yaml -> env bridge.
+    ir = matrix_cfg.get("intelligent_reaction")
+    if ir is not None and not os.getenv("MATRIX_INTELLIGENT_REACTION"):
+        if isinstance(ir, bool):
+            os.environ["MATRIX_INTELLIGENT_REACTION"] = str(ir).lower()
+        elif isinstance(ir, dict):
+            os.environ["MATRIX_INTELLIGENT_REACTION"] = "true"
+            for key in ("model", "backup_model", "context_file"):
+                if key in ir and not os.getenv(f"MATRIX_INTELLIGENT_REACTION_{key.upper()}"):
+                    os.environ[f"MATRIX_INTELLIGENT_REACTION_{key.upper()}"] = str(ir[key])
+    return seeded or None
 
 
 def _is_connected(config) -> bool:

@@ -6032,9 +6032,14 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        # A short-reply decision needs the completed reply, before any native
+        # draft/edit has made it public. This applies to every adapter, including Matrix.
+        _conversation_adapter = self._runner._adapter_for_source(ctx.source)
+        if _conversation_adapter and _conversation_adapter.conversation_middleware().buffers_output is True:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
-        _want_interim_consumer = _want_interim_messages
+        _want_interim_consumer = _want_interim_messages and not (_conversation_adapter and _conversation_adapter.conversation_middleware().buffers_output is True)
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -14639,6 +14644,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
+        # Profile-local automation hands Matrix envelopes to this process instead
+        # of creating another E2EE client. The existing Matrix adapter is the
+        # only owner of the active device and its crypto store.
+        try:
+            matrix_adapter = self.adapters.get(Platform.MATRIX)
+            if matrix_adapter is not None:
+                from gateway.matrix_outbox import consume_forever
+                self._matrix_outbox_stop = asyncio.Event()
+                self._matrix_outbox_task = asyncio.create_task(
+                    consume_forever(matrix_adapter, self._matrix_outbox_stop)
+                )
+                self._background_tasks.add(self._matrix_outbox_task)
+                self._matrix_outbox_task.add_done_callback(self._background_tasks.discard)
+                logger.info("Matrix automation outbox consumer started")
+        except Exception:
+            logger.exception("Matrix automation outbox consumer failed to start")
+
         try:
             await self._ensure_hosted_room_worker()
         except Exception:
@@ -20078,7 +20100,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return EphemeralReply(
+                f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            )
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -23766,6 +23790,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Suppressing intentional silence marker for session %s",
                     session_entry.session_id,
                 )
+                _silence_adapter = self._adapter_for_source(source)
+                if _silence_adapter is not None:
+                    _silence_adapter.conversation_middleware().output_suppressed(
+                        event, response, "host_intentional_silence"
+                    )
                 response = ""
 
             # Auto voice reply: send TTS audio before the text response
@@ -26817,6 +26846,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if profile and metadata is not None:
             metadata = dict(metadata)
             metadata["hermes_profile"] = profile
+        from gateway.conversation import ConversationKey
+        metadata = dict(metadata or {})
+        metadata.update(ConversationKey.from_source(source).metadata())
         return metadata
 
     def _thread_metadata_for_target(

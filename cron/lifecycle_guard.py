@@ -25,9 +25,10 @@ command shape.
 
 This is a defence-in-depth layer.  ``tools/terminal_tool.py`` blocks direct
 commands and shell scripts they reference when ``_HERMES_GATEWAY=1``. It also
-rejects ``launchctl submit`` in gateway sessions because launchd treats that
-primitive as a persistent KeepAlive job, not a one-shot task. ``hermes gateway
-stop|restart|uninstall`` separately refuse to self-target from inside the gateway.
+rejects ``launchctl submit`` and ``systemd-run`` in gateway sessions because
+both primitives can detach lifecycle work from the process that requested it.
+``hermes gateway stop|restart|uninstall`` separately refuse to self-target from
+inside the gateway.
 Blocking cron specs at creation time as well means the agent gets an immediate,
 informative rejection instead of scheduling a job that will only fail
 (silently) when it fires.
@@ -713,6 +714,25 @@ def contains_launchctl_submit_command(command: str) -> bool:
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
+    return False
+
+
+def contains_systemd_run_command(command: str) -> bool:
+    """Detect an executed ``systemd-run`` command, not quoted diagnostic text.
+
+    A gateway child can use ``systemd-run --on-active=...`` to schedule a
+    transient unit which survives the child and later stops/restarts its own
+    gateway or mutates its crypto store. That bypasses both the direct
+    lifecycle guard and referenced-script scanning because systemd, rather than
+    the gateway child, eventually executes the helper. The unit name is
+    attacker-controlled, so detection must be executable- and label-independent.
+    """
+    for segment in _iter_command_segments(command):
+        index = _command_token_index(segment)
+        if index is None:
+            continue
+        if Path(segment[index]).name == "systemd-run":
+            return True
     return False
 
 

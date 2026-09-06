@@ -4,9 +4,9 @@ secondary profile resolves its own recovery key (not the default profile's),
 otherwise E2EE cross-signing verification fails with "Key MAC does not match".
 
 The fix routes the recovery-key read through ``_scoped_recovery_key()``,
-which uses :func:`agent.secret_scope.get_secret` (scope-aware) and only falls
-back to ``os.getenv`` for an *unscoped* read under multiplex — mirroring the
-established Slack app-token pattern (#59739).
+which uses :func:`agent.secret_scope.get_secret`. A scoped miss is authoritative,
+and an unscoped read while multiplexing is active fails closed rather than
+borrowing a process- or default-profile secret.
 """
 import pytest
 
@@ -42,17 +42,12 @@ class TestScopedRecoveryKey:
         finally:
             ss.reset_secret_scope(token)
 
-    def test_multiplex_active_unscoped_falls_back_to_environ(self, monkeypatch):
-        """Default-profile startup loop under multiplex: unscoped read is fine.
-
-        An unscoped read raises ``UnscopedSecretError``; in that context
-        os.environ holds that profile's own value, so we fall back to it rather
-        than crashing startup. This matches the Slack adapter's behavior.
-        """
+    def test_multiplex_active_unscoped_fails_closed(self, monkeypatch):
+        """An unscoped multiplex read must not borrow process credentials."""
         monkeypatch.setenv("MATRIX_RECOVERY_KEY", "default-profile-key")
         ss.set_multiplex_active(True)
         # No secret scope installed -> get_secret raises UnscopedSecretError.
-        assert _scoped_recovery_key() == "default-profile-key"
+        assert _scoped_recovery_key() == ""
 
     def test_multiplex_active_scoped_missing_key_is_empty(self, monkeypatch):
         """A scope without the key must NOT fall through to another profile's env.

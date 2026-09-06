@@ -212,6 +212,66 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
     assert runner._is_user_authorized(sender_source) is True
 
 
+def _matrix_room_scoped_runner(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@owner:example.org")
+    room_id = "!website-seo-room"
+    user_id = "@outsider:example.org"
+    config = GatewayConfig(
+        platforms={
+            Platform.MATRIX: PlatformConfig(
+                enabled=True,
+                extra={
+                    "groups": {
+                        room_id: {"allow_from": [user_id]},
+                    },
+                },
+            ),
+        },
+    )
+    runner, _adapter = _make_runner(Platform.MATRIX, config)
+    return runner, room_id, user_id
+
+
+def test_matrix_room_allow_from_authorizes_sender_in_exact_group(monkeypatch):
+    runner, room_id, user_id = _matrix_room_scoped_runner(monkeypatch)
+    source = SessionSource(
+        platform=Platform.MATRIX,
+        user_id=user_id,
+        chat_id=room_id,
+        user_name="hungryfox",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_matrix_room_allow_from_does_not_authorize_sender_in_dm(monkeypatch):
+    runner, _room_id, user_id = _matrix_room_scoped_runner(monkeypatch)
+    source = SessionSource(
+        platform=Platform.MATRIX,
+        user_id=user_id,
+        chat_id="!private-dm",
+        user_name="hungryfox",
+        chat_type="dm",
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
+def test_matrix_room_allow_from_does_not_authorize_sender_in_other_group(monkeypatch):
+    runner, _room_id, user_id = _matrix_room_scoped_runner(monkeypatch)
+    source = SessionSource(
+        platform=Platform.MATRIX,
+        user_id=user_id,
+        chat_id="!other-room",
+        user_name="hungryfox",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
 @pytest.mark.asyncio
 async def test_unauthorized_dm_pairs_by_default(monkeypatch):
     _clear_auth_env(monkeypatch)

@@ -3238,6 +3238,16 @@ class BasePlatformAdapter(ABC):
     # routing is platform-generic instead of Discord-only.
     gateway_runner = None  # type: ignore[assignment]  # set by gateway/run.py
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from gateway.conversation import conversation_output
+        # The base contract owns filtering; transport implementations remain native.
+        for name in ("send", "edit_message", "send_draft", "send_image", "send_image_file",
+                     "send_document", "send_voice", "send_video", "send_animation", "send_multiple_images"):
+            method = getattr(cls, name, None)
+            if method is not None:
+                setattr(cls, name, conversation_output(method))
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -5787,6 +5797,17 @@ class BasePlatformAdapter(ABC):
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
+        middleware = self.__dict__.get("_conversation_middleware")
+        if middleware is not None and args and args[0].source is not None:
+            event = args[0]
+            session_id = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+                profile=self._session_key_profile(event.source),
+            )
+            middleware.processing(event, hook_name, session_id,
+                                  args[1].value if len(args) > 1 else None)
         hook = getattr(self, hook_name, None)
         if not callable(hook):
             return
@@ -6377,7 +6398,17 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def conversation_middleware(self):
+        """Lazily bind registered native conversation middleware to this adapter."""
+        if "_conversation_middleware" not in self.__dict__:
+            from gateway.conversation import ConversationMiddleware
+            self._conversation_middleware = ConversationMiddleware(self)
+        return self._conversation_middleware
+
     async def handle_message(self, event: MessageEvent) -> None:
+        await self.conversation_middleware().receive(event)
+
+    async def _handle_message_after_conversation(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
         
@@ -7427,6 +7458,9 @@ class BasePlatformAdapter(ABC):
         # disconnecting adapter, logs send-failures, and may linger
         # until it completes on its own.  Retrying the drain until the
         # task set stabilizes closes the window.
+        middleware = self.__dict__.get("_conversation_middleware")
+        if middleware is not None:
+            await middleware.close()
         MAX_DRAIN_ROUNDS = 5
         for _ in range(MAX_DRAIN_ROUNDS):
             tasks = [task for task in self._background_tasks if not task.done()]

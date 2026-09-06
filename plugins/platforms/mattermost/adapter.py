@@ -860,6 +860,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # For DMs, user_id is sufficient.  For channels, check for @mention.
         message_text = post.get("message", "")
+        has_mention = False
 
         # Mention-gating for non-DM channels.
         # Config (config.yaml `mattermost.*` with env-var fallback):
@@ -1014,6 +1015,7 @@ class MattermostAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=post,
+            metadata={"conversation_mentioned": has_mention},
             message_id=post_id,
             media_urls=media_urls if media_urls else None,
             media_types=media_types if media_types else None,

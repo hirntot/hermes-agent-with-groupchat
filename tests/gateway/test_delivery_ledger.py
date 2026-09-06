@@ -131,6 +131,15 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    @pytest.mark.parametrize("action", ["restarting", "shutting down"])
+    def test_gateway_drain_notice_is_not_recorded(self, action):
+        _record(
+            content=(
+                f"⏳ Gateway is {action} and is not accepting new work right now."
+            )
+        )
+        assert _row("ob-1") is None
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):
@@ -159,6 +168,22 @@ class TestSweep:
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
+
+    def test_legacy_gateway_drain_notice_is_abandoned_not_replayed(self):
+        _record()
+        _orphan("ob-1")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET content=? WHERE obligation_id=?",
+                (
+                    "⏳ Gateway is shutting down and is not accepting new work right now.",
+                    "ob-1",
+                ),
+            )
+
+        assert dl.sweep_recoverable() == []
+        assert _row("ob-1")["state"] == "abandoned"
+        assert _row("ob-1")["last_error"] == "non-durable gateway notice"
 
 
 class TestRuntimeFailedSweep:

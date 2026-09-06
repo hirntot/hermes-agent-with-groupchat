@@ -3146,6 +3146,7 @@ def terminal_tool(
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
+                contains_systemd_run_command,
                 lifecycle_scan_root_within_budget,
             )
             # Keep the specific launchctl diagnostic when this optional
@@ -3163,6 +3164,21 @@ def terminal_tool(
                         "KeepAlive job and is unsafe from inside the gateway process. "
                         "Use Hermes cron for one-shot delayed work, or install an "
                         "explicit LaunchAgent from a separate shell."
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+            if (
+                lifecycle_scan_root_within_budget(command)
+                and contains_systemd_run_command(command)
+            ):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: systemd-run cannot create detached transient units "
+                        "from inside the gateway process. This prevents delayed "
+                        "self-restarts and crypto-store mutation outside the gateway's "
+                        "lifecycle guard. Use an administrator-controlled external shell."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)

@@ -44,6 +44,8 @@ def _make_fake_mautrix():
     class EventType:
         ROOM_MESSAGE = "m.room.message"
         REACTION = "m.reaction"
+        TYPING = "m.typing"
+        ROOM_REDACTION = "m.room.redaction"
         ROOM_ENCRYPTED = "m.room.encrypted"
         ROOM_NAME = "m.room.name"
 
@@ -617,6 +619,17 @@ class TestMatrixFormatMessage:
 # ---------------------------------------------------------------------------
 
 class TestMatrixRenderingPayloads:
+    @pytest.fixture(autouse=True)
+    def _allow_pingpong_guard(self, monkeypatch):
+        process = MagicMock()
+        process.returncode = 0
+        process.communicate = AsyncMock(return_value=(b"ALLOW", b""))
+        monkeypatch.setattr(
+            asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        )
+
     def setup_method(self):
         self.adapter = _make_adapter()
         self.mock_client = MagicMock()
@@ -1431,7 +1444,8 @@ class TestMatrixUploadAndSend:
         adapter = _make_adapter()
         adapter._encryption = True
         mock_client = MagicMock()
-        mock_client.crypto = object()
+        mock_client.crypto = MagicMock()
+        mock_client.crypto.crypto_store.get_outbound_group_session = AsyncMock(return_value=None)
         mock_client.state_store = MagicMock()
         mock_client.state_store.is_encrypted = AsyncMock(return_value=True)
         mock_client.upload_media = AsyncMock(return_value="mxc://example.org/enc")
@@ -1591,7 +1605,1256 @@ class TestMatrixDiagnostics:
         assert "diagnostic-secret-recovery-key" not in str(diagnostics)
 
 
+class TestMatrixOwnDeviceSigning:
+    def test_single_profile_recovery_key_falls_back_to_own_hermes_home(
+        self, tmp_path, monkeypatch
+    ):
+        import plugins.platforms.matrix.adapter as matrix_mod
+
+        (tmp_path / ".env").write_text('MATRIX_RECOVERY_KEY="profile-key"\n')
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(matrix_mod, "get_secret", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(matrix_mod, "is_multiplex_active", lambda: False)
+
+        assert matrix_mod._scoped_recovery_key() == "profile-key"
+
+    @pytest.mark.asyncio
+    async def test_fresh_own_device_is_fetched_before_cross_signing(self):
+        from plugins.platforms.matrix.adapter import _get_own_device_for_signing
+
+        device = MagicMock(device_id="NEWDEVICE")
+        olm = MagicMock()
+        olm.crypto_store.get_device = AsyncMock(return_value=None)
+        olm.get_or_fetch_device = AsyncMock(return_value=device)
+
+        result = await _get_own_device_for_signing(
+            olm,
+            "@bot:example.org",
+            "NEWDEVICE",
+        )
+
+        assert result is device
+        olm.crypto_store.get_device.assert_awaited_once_with(
+            "@bot:example.org",
+            "NEWDEVICE",
+        )
+        olm.get_or_fetch_device.assert_awaited_once_with(
+            "@bot:example.org",
+            "NEWDEVICE",
+        )
+
+
+class TestReliableMatrixOlmMachine:
+    @pytest.mark.asyncio
+    async def test_group_key_share_rekeys_one_device_when_session_is_missing(self):
+        from mautrix.crypto.encrypt_megolm import key_missing
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        recovered = object()
+
+        class BaseOlmMachine:
+            def __init__(self):
+                self.crypto_store = MagicMock()
+                self.crypto_store.remove_outbound_group_session = AsyncMock()
+
+            async def _find_olm_sessions(
+                self, session, user_id, device_id, device
+            ):
+                return recovered
+
+        machine = _make_reliable_olm_machine(BaseOlmMachine)()
+        machine.send_encrypted_to_device = AsyncMock()
+        machine._hermes_pending_key_shares = {"!room:example.org": set()}
+        session = MagicMock(room_id="!room:example.org")
+        device = MagicMock(device_id="LENADEVICE")
+
+        result = await machine._find_olm_sessions(
+            session,
+            "@lena:example.org",
+            "LENADEVICE",
+            device,
+        )
+
+        assert result is recovered
+        machine.send_encrypted_to_device.assert_awaited_once()
+        call = machine.send_encrypted_to_device.await_args
+        assert call.args[0] is device
+        assert str(call.args[1]) == "m.dummy"
+        assert call.kwargs == {"_force_recreate_session": True}
+        assert machine._hermes_pending_key_shares["!room:example.org"] == set()
+
+    @pytest.mark.asyncio
+    async def test_group_key_share_rekeys_even_with_persisted_olm_session(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        persisted = object()
+        refreshed = object()
+
+        class BaseOlmMachine:
+            async def _find_olm_sessions(
+                self, session, user_id, device_id, device
+            ):
+                return refreshed
+
+        machine = _make_reliable_olm_machine(BaseOlmMachine)()
+        machine.send_encrypted_to_device = AsyncMock()
+        machine._hermes_pending_key_shares = {"!room:example.org": set()}
+        session = MagicMock(room_id="!room:example.org")
+        device = MagicMock(device_id="LENADEVICE")
+
+        result = await machine._find_olm_sessions(
+            session, "@lena:example.org", "LENADEVICE", device
+        )
+
+        assert result is refreshed
+        machine.send_encrypted_to_device.assert_awaited_once()
+        assert machine.send_encrypted_to_device.await_args.kwargs == {
+            "_force_recreate_session": True
+        }
+
+    @pytest.mark.asyncio
+    async def test_rekey_happens_before_base_marks_device_as_shared(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        fresh_session = object()
+
+        class BaseOlmMachine:
+            def __init__(self):
+                self.base_calls = 0
+
+            async def _find_olm_sessions(
+                self, session, user_id, device_id, device
+            ):
+                self.base_calls += 1
+                key = (user_id, device_id)
+                if key in session.users_shared_with:
+                    return "already-shared"
+                session.users_shared_with.add(key)
+                return fresh_session, device
+
+        machine = _make_reliable_olm_machine(BaseOlmMachine)()
+        machine.send_encrypted_to_device = AsyncMock()
+        machine._hermes_pending_key_shares = {"!room:example.org": set()}
+        session = MagicMock(room_id="!room:example.org")
+        session.users_shared_with = set()
+        device = MagicMock(device_id="LENADEVICE")
+
+        result = await machine._find_olm_sessions(
+            session, "@lena:example.org", "LENADEVICE", device
+        )
+
+        assert result == (fresh_session, device)
+        assert machine.base_calls == 1
+        assert ("@lena:example.org", "LENADEVICE") in session.users_shared_with
+        machine.send_encrypted_to_device.assert_awaited_once()
+
+    def test_real_olm_class_is_instantiated_through_reliable_wrapper(self):
+        from plugins.platforms.matrix.adapter import _create_reliable_olm_machine
+
+        class BaseOlmMachine:
+            def __init__(self, marker):
+                self.marker = marker
+
+        machine = _create_reliable_olm_machine(BaseOlmMachine, "expected")
+
+        assert type(machine).__name__ == "ReliableBaseOlmMachine"
+        assert machine.marker == "expected"
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_megolm_session_starts_recovery_and_reraises(self):
+        from mautrix.errors import SessionNotFound
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            async def decrypt_megolm_event(self, event):
+                raise SessionNotFound("missing-session", "sender-key")
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine._recover_missing_megolm_event = AsyncMock()
+        encrypted_event = MagicMock()
+
+        with pytest.raises(SessionNotFound):
+            await machine.decrypt_megolm_event(encrypted_event)
+
+        machine._recover_missing_megolm_event.assert_awaited_once_with(
+            encrypted_event
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovery_failure_does_not_replace_session_not_found(self):
+        from mautrix.errors import SessionNotFound
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            async def decrypt_megolm_event(self, event):
+                raise SessionNotFound("missing-session", "sender-key")
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.log = MagicMock()
+        machine._recover_missing_megolm_event = AsyncMock(
+            side_effect=RuntimeError("recovery failed")
+        )
+
+        with pytest.raises(SessionNotFound):
+            await machine.decrypt_megolm_event(MagicMock())
+
+        machine.log.warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_recovery_rekeys_requests_and_deduplicates(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            pass
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.log = MagicMock()
+        machine.client = MagicMock(device_id="LENDEVICE")
+        machine.client.send_to_device = AsyncMock()
+        target_device = MagicMock(device_id="OWNERDEVICE")
+        machine.get_or_fetch_device_by_key = AsyncMock(return_value=target_device)
+        machine.send_encrypted_to_device = AsyncMock()
+        machine._queue_missing_megolm_retry = MagicMock()
+
+        encrypted_event = MagicMock()
+        encrypted_event.room_id = "!room:example.org"
+        encrypted_event.event_id = "$encrypted"
+        encrypted_event.sender = "@owner:example.org"
+        encrypted_event.content.sender_key = "curve25519-key"
+        encrypted_event.content.device_id = "OWNERDEVICE"
+        encrypted_event.content.session_id = "missing-session"
+        encrypted_event.content.algorithm = "m.megolm.v1.aes-sha2"
+
+        await machine._recover_missing_megolm_event(encrypted_event)
+        await machine._recover_missing_megolm_event(encrypted_event)
+
+        machine.send_encrypted_to_device.assert_awaited_once()
+        assert machine.send_encrypted_to_device.await_args.kwargs == {
+            "_force_recreate_session": True
+        }
+        machine.client.send_to_device.assert_awaited_once()
+        event_type, messages = machine.client.send_to_device.await_args.args
+        assert str(event_type) == "m.room_key_request"
+        request = messages["@owner:example.org"]["OWNERDEVICE"]
+        assert str(request.action) == "request"
+        assert request.requesting_device_id == "LENDEVICE"
+        assert request.body.room_id == "!room:example.org"
+        assert request.body.session_id == "missing-session"
+        assert request.body.sender_key == "curve25519-key"
+        assert machine._queue_missing_megolm_retry.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_recovery_skips_events_without_device_metadata(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            pass
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.log = MagicMock()
+        machine.client = MagicMock(device_id="LENDEVICE")
+        machine.client.send_to_device = AsyncMock()
+        machine.get_or_fetch_device_by_key = AsyncMock()
+        machine._queue_missing_megolm_retry = MagicMock()
+
+        encrypted_event = MagicMock()
+        encrypted_event.room_id = "!room:example.org"
+        encrypted_event.event_id = "$encrypted"
+        encrypted_event.sender = "@owner:example.org"
+        encrypted_event.content.sender_key = None
+        encrypted_event.content.device_id = None
+        encrypted_event.content.session_id = "missing-session"
+
+        await machine._recover_missing_megolm_event(encrypted_event)
+
+        machine._queue_missing_megolm_retry.assert_not_called()
+        machine.get_or_fetch_device_by_key.assert_not_awaited()
+        machine.client.send_to_device.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_queue_deduplicates_running_task(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            pass
+
+        machine = _make_reliable_olm_machine(BaseOlmMachine)()
+        release = asyncio.Event()
+
+        async def wait_for_release(event):
+            await release.wait()
+
+        machine._retry_missing_megolm_event = AsyncMock(side_effect=wait_for_release)
+        encrypted_event = MagicMock(event_id="$same-event")
+
+        machine._queue_missing_megolm_retry(encrypted_event)
+        first_task = machine._hermes_missing_megolm_events["$same-event"]
+        machine._queue_missing_megolm_retry(encrypted_event)
+
+        assert machine._hermes_missing_megolm_events["$same-event"] is first_task
+        machine._retry_missing_megolm_event.assert_called_once_with(encrypted_event)
+
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_retry_times_out_without_dispatch(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            pass
+
+        machine = _make_reliable_olm_machine(BaseOlmMachine)()
+        machine.log = MagicMock()
+        machine.crypto_store = MagicMock()
+        machine.crypto_store.has_group_session = AsyncMock(return_value=False)
+        machine.client = MagicMock()
+        machine.client.dispatch_event = MagicMock(return_value=[])
+        encrypted_event = MagicMock()
+        encrypted_event.room_id = "!room:example.org"
+        encrypted_event.event_id = "$timeout"
+        encrypted_event.content.session_id = "missing-session"
+
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            await machine._retry_missing_megolm_event(encrypted_event)
+
+        assert machine.crypto_store.has_group_session.await_count == 61
+        assert sleep_mock.await_count == 60
+        machine.client.dispatch_event.assert_not_called()
+        assert "did not arrive within 60 seconds" in str(
+            machine.log.warning.call_args.args[0]
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_inbound_retry_dispatches_after_key_arrives(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        decrypted_event = MagicMock()
+
+        class BaseOlmMachine:
+            async def decrypt_megolm_event(self, event):
+                return decrypted_event
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.log = MagicMock()
+        machine.crypto_store = MagicMock()
+        machine.crypto_store.has_group_session = AsyncMock(return_value=True)
+        machine.client = MagicMock()
+        machine.client.dispatch_event = MagicMock(return_value=[])
+
+        encrypted_event = MagicMock()
+        encrypted_event.room_id = "!room:example.org"
+        encrypted_event.event_id = "$encrypted"
+        encrypted_event.source = "joined_room"
+        encrypted_event.content.session_id = "missing-session"
+
+        await machine._retry_missing_megolm_event(encrypted_event)
+
+        machine.crypto_store.has_group_session.assert_awaited_once_with(
+            "!room:example.org", "missing-session"
+        )
+        machine.client.dispatch_event.assert_called_once_with(
+            decrypted_event, "joined_room"
+        )
+
+    @pytest.mark.asyncio
+    async def test_decrypt_preserves_source_device_metadata(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            async def decrypt_megolm_event(self, event):
+                return {"mautrix": {"was_encrypted": True}}
+
+        encrypted_event = MagicMock()
+        encrypted_event.content.device_id = "ACTIVEDEVICE"
+        encrypted_event.content.sender_key = "curve25519-key"
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.get_or_fetch_device_by_key = AsyncMock(
+            return_value=MagicMock(device_id="ACTIVEDEVICE")
+        )
+        result = await machine.decrypt_megolm_event(encrypted_event)
+
+        assert result["mautrix"]["source_device_id"] == "ACTIVEDEVICE"
+        assert result["mautrix"]["source_sender_key"] == "curve25519-key"
+
+    @pytest.mark.asyncio
+    async def test_decrypt_uses_device_bound_to_sender_key_not_event_device_id(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            async def decrypt_megolm_event(self, event):
+                return {"mautrix": {"was_encrypted": True}}
+
+        encrypted_event = MagicMock()
+        encrypted_event.sender = "@alice:example.org"
+        encrypted_event.content.device_id = "SPOOFEDDEVICE"
+        encrypted_event.content.sender_key = "authenticated-curve25519-key"
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.get_or_fetch_device_by_key = AsyncMock(
+            return_value=MagicMock(device_id="VERIFIEDDEVICE")
+        )
+
+        result = await machine.decrypt_megolm_event(encrypted_event)
+
+        assert result["mautrix"]["source_device_id"] == "VERIFIEDDEVICE"
+        assert result["mautrix"]["source_sender_key"] == (
+            "authenticated-curve25519-key"
+        )
+
+    @pytest.mark.asyncio
+    async def test_incomplete_group_share_fails_closed(self):
+        from plugins.platforms.matrix.adapter import (
+            _IncompleteMatrixKeyShare,
+            _make_reliable_olm_machine,
+        )
+
+        class BaseOlmMachine:
+            async def send_encrypted_to_device(self, *args, **kwargs):
+                return None
+
+            async def _find_olm_sessions(
+                self, session, user_id, device_id, device
+            ):
+                from mautrix.crypto.encrypt_megolm import key_missing
+
+                return key_missing
+
+            async def _share_group_session(self, room_id, users):
+                session = MagicMock(room_id=room_id)
+                await self._find_olm_sessions(
+                    session, users[0], "ALICEDEVICE", MagicMock()
+                )
+
+        session = MagicMock()
+        session.users_shared_with = set()
+        session.users_ignored = set()
+        device = MagicMock()
+
+        store = MagicMock()
+        store.get_outbound_group_session = AsyncMock(return_value=session)
+        store.get_devices = AsyncMock(return_value={"ALICEDEVICE": device})
+        store.remove_outbound_group_session = AsyncMock()
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.crypto_store = store
+        machine.client = MagicMock(mxid="@bot:example.org", device_id="BOTDEVICE")
+
+        with pytest.raises(_IncompleteMatrixKeyShare):
+            await machine._share_group_session(
+                "!room:example.org", ["@alice:example.org"]
+            )
+
+        store.remove_outbound_group_session.assert_awaited_once_with(
+            "!room:example.org"
+        )
+
+    @pytest.mark.asyncio
+    async def test_persisted_session_without_transient_sets_does_not_false_fail(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            async def _share_group_session(self, room_id, users):
+                return None
+
+        persisted_session = MagicMock()
+        persisted_session.users_shared_with = set()
+        persisted_session.users_ignored = set()
+        store = MagicMock()
+        store.get_outbound_group_session = AsyncMock(return_value=persisted_session)
+        store.get_devices = AsyncMock(
+            return_value={"ALICEDEVICE": MagicMock()}
+        )
+        store.remove_outbound_group_session = AsyncMock()
+
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.crypto_store = store
+        machine.client = MagicMock(mxid="@bot:example.org", device_id="BOTDEVICE")
+
+        await machine._share_group_session(
+            "!room:example.org", ["@alice:example.org"]
+        )
+
+        store.remove_outbound_group_session.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_then_created_olm_session_clears_share_failure(self):
+        from plugins.platforms.matrix.adapter import _make_reliable_olm_machine
+
+        class BaseOlmMachine:
+            find_count = 0
+
+            async def send_encrypted_to_device(self, *args, **kwargs):
+                return None
+
+            async def _find_olm_sessions(
+                self, session, user_id, device_id, device
+            ):
+                from mautrix.crypto.encrypt_megolm import key_missing
+
+                self.find_count += 1
+                if self.find_count == 1:
+                    return key_missing
+                return MagicMock(), device
+
+            async def _share_group_session(self, room_id, users):
+                session = MagicMock(room_id=room_id)
+                device = MagicMock()
+                await self._find_olm_sessions(
+                    session, users[0], "ALICEDEVICE", device
+                )
+                await self._find_olm_sessions(
+                    session, users[0], "ALICEDEVICE", device
+                )
+
+        store = MagicMock()
+        store.remove_outbound_group_session = AsyncMock()
+        reliable_cls = _make_reliable_olm_machine(BaseOlmMachine)
+        machine = reliable_cls()
+        machine.crypto_store = store
+
+        await machine._share_group_session(
+            "!room:example.org", ["@alice:example.org"]
+        )
+
+        store.remove_outbound_group_session.assert_not_awaited()
+
+    def test_records_last_active_encrypted_sender_device(self):
+        adapter = _make_adapter()
+
+        class Event:
+            def __getitem__(self, key):
+                assert key == "mautrix"
+                return {
+                    "was_encrypted": True,
+                    "source_device_id": "ACTIVEDEVICE",
+                    "source_sender_key": "curve25519-key",
+                }
+
+        adapter._remember_active_e2ee_device(
+            "!room:example.org", "@alice:example.org", Event()
+        )
+
+        record = adapter._active_e2ee_devices["!room:example.org"]
+        assert record.user_id == "@alice:example.org"
+        assert record.device_id == "ACTIVEDEVICE"
+        assert record.sender_key == "curve25519-key"
+
+    @pytest.mark.asyncio
+    async def test_room_message_intake_records_active_e2ee_device(self):
+        adapter = _make_adapter()
+        adapter._startup_ts = time.time() - 10
+        adapter._remember_active_e2ee_device = MagicMock()
+        event = MagicMock()
+        event.room_id = "!room1:example.org"
+        event.sender = "@alice:example.org"
+        event.event_id = "$event1"
+        event.timestamp = int(time.time() * 1000)
+        event.content = {"body": "hello", "msgtype": "m.text"}
+
+        await adapter._on_room_message(event)
+
+        adapter._remember_active_e2ee_device.assert_called_once_with(
+            "!room1:example.org", "@alice:example.org", event
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_active_device_skips_dm_resolution(self):
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._client = MagicMock()
+        adapter._client.crypto = MagicMock()
+        adapter._client.crypto.crypto_store.get_outbound_group_session = AsyncMock(
+            return_value=None
+        )
+        adapter._is_dm_room = AsyncMock(
+            side_effect=AssertionError("DM resolution must not run")
+        )
+
+        await adapter._prepare_outbound_e2ee("!room:example.org")
+
+        adapter._is_dm_room.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dm_resolution_failure_blocks_e2ee_preflight(self):
+        from plugins.platforms.matrix.adapter import (
+            _ActiveE2EEDevice,
+            _IncompleteMatrixKeyShare,
+        )
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._active_e2ee_devices["!room:example.org"] = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="ACTIVEDEVICE",
+            sender_key="curve25519-key",
+            seen_at=time.time(),
+        )
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(return_value=None)
+        adapter._client = MagicMock(
+            crypto=MagicMock(crypto_store=crypto_store)
+        )
+        adapter._is_dm_room = AsyncMock(
+            side_effect=RuntimeError("room identity unavailable")
+        )
+
+        with pytest.raises(_IncompleteMatrixKeyShare):
+            await adapter._prepare_outbound_e2ee("!room:example.org")
+
+    @pytest.mark.asyncio
+    async def test_new_megolm_session_rekeys_recent_active_dm_device(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._is_dm_room = AsyncMock(return_value=True)
+        adapter._active_e2ee_devices["!room:example.org"] = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="ACTIVEDEVICE",
+            sender_key="curve25519-key",
+            seen_at=time.time(),
+        )
+
+        device = MagicMock()
+        device.device_id = "ACTIVEDEVICE"
+        device.identity_key = "curve25519-key"
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(return_value=None)
+        crypto_store.get_device = AsyncMock(return_value=device)
+        crypto = MagicMock()
+        crypto.crypto_store = crypto_store
+        crypto.send_encrypted_to_device = AsyncMock()
+        adapter._client = MagicMock()
+        adapter._client.crypto = crypto
+
+        await adapter._prepare_outbound_e2ee("!room:example.org")
+
+        crypto.send_encrypted_to_device.assert_awaited_once()
+        call = crypto.send_encrypted_to_device.await_args
+        assert call.args[0] is device
+        assert call.kwargs["_force_recreate_session"] is True
+
+    @pytest.mark.asyncio
+    async def test_persisted_shared_session_is_rekeyed_and_rotated_once(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._is_dm_room = AsyncMock(return_value=True)
+        adapter._active_e2ee_devices["!room:example.org"] = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="ACTIVEDEVICE",
+            sender_key="curve25519-key",
+            seen_at=time.time(),
+        )
+
+        stale_session = MagicMock()
+        stale_session.id = "stale-megolm-session"
+        stale_session.shared = True
+        stale_session.expired = False
+        device = MagicMock(
+            device_id="ACTIVEDEVICE", identity_key="curve25519-key"
+        )
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(
+            return_value=stale_session
+        )
+        crypto_store.get_device = AsyncMock(return_value=device)
+        crypto_store.remove_outbound_group_session = AsyncMock()
+        crypto = MagicMock()
+        crypto.crypto_store = crypto_store
+        crypto.send_encrypted_to_device = AsyncMock()
+        adapter._client = MagicMock(crypto=crypto)
+
+        await adapter._prepare_outbound_e2ee("!room:example.org")
+
+        crypto.send_encrypted_to_device.assert_awaited_once()
+        crypto_store.remove_outbound_group_session.assert_awaited_once_with(
+            "!room:example.org"
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_room_rotates_session_without_active_inbound_device(self):
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._is_dm_room = AsyncMock(
+            side_effect=AssertionError("DM resolution must not run")
+        )
+        stale_session = MagicMock(shared=True, expired=False, message_count=32)
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(
+            return_value=stale_session
+        )
+        crypto_store.remove_outbound_group_session = AsyncMock()
+        adapter._client = MagicMock(crypto=MagicMock(crypto_store=crypto_store))
+
+        await adapter._prepare_outbound_e2ee("!room:example.org")
+
+        crypto_store.remove_outbound_group_session.assert_awaited_once_with(
+            "!room:example.org"
+        )
+        adapter._is_dm_room.assert_not_awaited()
+
+
 class TestMatrixEncryptedSendFallback:
+    @pytest.mark.asyncio
+    async def test_successful_send_marks_current_megolm_session_prepared(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        active = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="ACTIVEDEVICE",
+            sender_key="curve25519-key",
+            seen_at=time.time(),
+        )
+        adapter._prepare_outbound_e2ee = AsyncMock(return_value=active)
+        adapter._active_e2ee_devices["!room:example.org"] = active
+        current_session = MagicMock(
+            id="healthy-megolm-session", shared=True, expired=False
+        )
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(
+            return_value=current_session
+        )
+        crypto = MagicMock(crypto_store=crypto_store)
+        fake_client = MagicMock(crypto=crypto)
+        fake_client.send_message_event = AsyncMock(return_value="$event")
+        adapter._client = fake_client
+
+        result = await adapter.send("!room:example.org", "hello")
+
+        assert result.success is True
+        assert adapter._prepared_e2ee_sessions[
+            (
+                "!room:example.org",
+                "@alice:example.org",
+                "ACTIVEDEVICE",
+                "curve25519-key",
+            )
+        ] == "healthy-megolm-session"
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_megolm_recovery_tasks_and_clears_caches(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        retry_task = asyncio.create_task(asyncio.sleep(300))
+        crypto = MagicMock()
+        crypto._hermes_missing_megolm_events = {"$event": retry_task}
+        client = MagicMock(crypto=crypto)
+        client.api.session.close = AsyncMock()
+        adapter._client = client
+        adapter._active_e2ee_devices["!room:example.org"] = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="ACTIVEDEVICE",
+            sender_key="curve25519-key",
+            seen_at=time.time(),
+        )
+        adapter._prepared_e2ee_sessions[("room", "user", "device", "key")] = (
+            "session"
+        )
+        room_lock = asyncio.Lock()
+        await room_lock.acquire()
+        adapter._e2ee_send_locks["!room:example.org"] = room_lock
+
+        await adapter.disconnect()
+
+        assert retry_task.cancelled()
+        assert crypto._hermes_missing_megolm_events == {}
+        assert adapter._active_e2ee_devices == {}
+        assert adapter._prepared_e2ee_sessions == {}
+        assert adapter._e2ee_send_locks["!room:example.org"] is room_lock
+        assert room_lock.locked()
+        room_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_waits_for_inflight_connect_lifecycle(self):
+        adapter = _make_adapter()
+        connect_entered = asyncio.Event()
+        release_connect = asyncio.Event()
+        order = []
+
+        async def connect_unlocked(*, is_reconnect=False):
+            order.append("connect-enter")
+            connect_entered.set()
+            await release_connect.wait()
+            order.append("connect-exit")
+            return True
+
+        async def disconnect_unlocked():
+            order.append("disconnect")
+
+        adapter._connect_unlocked = AsyncMock(side_effect=connect_unlocked)
+        adapter._disconnect_unlocked = AsyncMock(side_effect=disconnect_unlocked)
+
+        connect_task = asyncio.create_task(adapter.connect())
+        await connect_entered.wait()
+        disconnect_task = asyncio.create_task(adapter.disconnect())
+        await asyncio.sleep(0)
+        adapter._disconnect_unlocked.assert_not_awaited()
+
+        release_connect.set()
+        assert await connect_task is True
+        await disconnect_task
+        assert order == ["connect-enter", "connect-exit", "disconnect"]
+
+    @pytest.mark.asyncio
+    async def test_device_key_share_upload_has_bounded_timeout(self):
+        adapter = _make_adapter()
+        client = MagicMock(device_id="DEVICE", mxid="@bot:example.org")
+        client.query_keys = AsyncMock(return_value=MagicMock(device_keys={}))
+        olm = MagicMock()
+        olm.account.identity_keys = {"ed25519": "local-key"}
+        olm.account.shared = True
+        olm.share_keys = AsyncMock()
+
+        async def bounded_wait_for(awaitable, *, timeout):
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        wait_for = AsyncMock(side_effect=bounded_wait_for)
+
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.wait_for", new=wait_for
+        ):
+            result = await adapter._verify_device_keys_on_server(client, olm)
+
+        assert result is False
+        assert wait_for.await_args.kwargs["timeout"] == 30
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_send_before_reconnect_client_can_be_used(self):
+        adapter = _make_adapter()
+        adapter._encryption = True
+        preflight_entered = asyncio.Event()
+        release_preflight = asyncio.Event()
+
+        async def prepare(*args, **kwargs):
+            preflight_entered.set()
+            await release_preflight.wait()
+            return None
+
+        adapter._prepare_outbound_e2ee = AsyncMock(side_effect=prepare)
+        client_a = MagicMock(crypto=None)
+        client_a.send_message_event = AsyncMock(return_value="$from-a")
+        client_a.api.session.close = AsyncMock()
+        adapter._client = client_a
+
+        send_task = asyncio.create_task(
+            adapter._send_reliable_event(
+                "!room:example.org", "m.room.message", {}
+            )
+        )
+        await preflight_entered.wait()
+        await adapter.disconnect()
+
+        client_b = MagicMock(crypto=None)
+        client_b.send_message_event = AsyncMock(return_value="$from-b")
+        adapter._client = client_b
+        release_preflight.set()
+        try:
+            await send_task
+        except asyncio.CancelledError:
+            pass
+
+        assert send_task.cancelled()
+        client_a.send_message_event.assert_not_awaited()
+        client_b.send_message_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_text_retry_blocked_in_share_keys(self):
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._prepare_outbound_e2ee = AsyncMock(return_value=None)
+        share_entered = asyncio.Event()
+        never_release = asyncio.Event()
+
+        async def share_keys():
+            share_entered.set()
+            await never_release.wait()
+
+        crypto = MagicMock()
+        crypto.share_keys = AsyncMock(side_effect=share_keys)
+        client = MagicMock(crypto=crypto)
+        client.send_message_event = AsyncMock(side_effect=Exception("encryption error"))
+        client.api.session.close = AsyncMock()
+        adapter._client = client
+        guard = MagicMock(returncode=0)
+        guard.communicate = AsyncMock(return_value=(b"", b""))
+
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=guard),
+        ):
+            send_task = asyncio.create_task(
+                adapter.send("!room:example.org", "hello")
+            )
+            await share_entered.wait()
+            await asyncio.wait_for(adapter.disconnect(), timeout=1)
+
+        cancelled_by_disconnect = send_task.cancelled()
+        if not send_task.done():
+            send_task.cancel()
+        await asyncio.gather(send_task, return_exceptions=True)
+        assert cancelled_by_disconnect
+
+    @pytest.mark.asyncio
+    async def test_persisted_shared_session_reaction_then_text_repairs_once(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        adapter._is_dm_room = AsyncMock(return_value=True)
+        adapter._active_e2ee_devices["!room:example.org"] = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="ACTIVEDEVICE",
+            sender_key="curve25519-key",
+            seen_at=time.time(),
+        )
+
+        stale = MagicMock(id="stale-session", shared=True, expired=False)
+        healthy = MagicMock(id="healthy-session", shared=True, expired=False)
+        state = {"session": stale}
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(
+            side_effect=lambda room_id: state["session"]
+        )
+
+        async def remove_session(room_id):
+            state["session"] = None
+
+        crypto_store.remove_outbound_group_session = AsyncMock(
+            side_effect=remove_session
+        )
+        device = MagicMock(device_id="ACTIVEDEVICE")
+        crypto_store.get_device = AsyncMock(return_value=device)
+        crypto = MagicMock(crypto_store=crypto_store)
+        crypto.get_or_fetch_device_by_key = AsyncMock(return_value=device)
+        crypto.send_encrypted_to_device = AsyncMock()
+        crypto.share_keys = AsyncMock()
+        client = MagicMock(crypto=crypto)
+
+        async def send_message_event(room_id, event_type, content):
+            if str(event_type) != "m.reaction":
+                state["session"] = healthy
+            return "$event"
+
+        client.send_message_event = AsyncMock(side_effect=send_message_event)
+        client.state_store.is_encrypted = AsyncMock(return_value=True)
+        adapter._client = client
+        guard = MagicMock(returncode=0)
+        guard.communicate = AsyncMock(return_value=(b"", b""))
+
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=guard),
+        ):
+            reaction_id = await adapter._send_reaction(
+                "!room:example.org", "$incoming", "\U0001f440"
+            )
+            first = await adapter.send("!room:example.org", "first response")
+            second = await adapter.send("!room:example.org", "second response")
+
+        assert reaction_id == "$event"
+        assert first.success is True
+        assert second.success is True
+        crypto.send_encrypted_to_device.assert_awaited_once()
+        crypto_store.remove_outbound_group_session.assert_awaited_once_with(
+            "!room:example.org"
+        )
+        crypto.share_keys.assert_not_awaited()
+        assert adapter._prepared_e2ee_sessions[
+            (
+                "!room:example.org",
+                "@alice:example.org",
+                "ACTIVEDEVICE",
+                "curve25519-key",
+            )
+        ] == "healthy-session"
+
+    @pytest.mark.asyncio
+    async def test_send_marks_the_device_snapshot_used_by_preflight(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        device_a = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="DEVICE_A",
+            sender_key="sender-key-a",
+            seen_at=time.time(),
+        )
+        device_b = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="DEVICE_B",
+            sender_key="sender-key-b",
+            seen_at=time.time(),
+        )
+        adapter._active_e2ee_devices["!room:example.org"] = device_a
+        adapter._prepare_outbound_e2ee = AsyncMock(return_value=device_a)
+        session = MagicMock(id="healthy-session", shared=True, expired=False)
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(return_value=session)
+        crypto = MagicMock(crypto_store=crypto_store)
+        client = MagicMock(crypto=crypto)
+
+        async def send_message_event(*args):
+            adapter._active_e2ee_devices["!room:example.org"] = device_b
+            return "$event"
+
+        client.send_message_event = AsyncMock(side_effect=send_message_event)
+        adapter._client = client
+
+        await adapter._send_reliable_event(
+            "!room:example.org", "m.room.message", {}
+        )
+
+        assert adapter._prepared_e2ee_sessions[
+            (
+                "!room:example.org",
+                "@alice:example.org",
+                "DEVICE_A",
+                "sender-key-a",
+            )
+        ] == "healthy-session"
+        assert (
+            "!room:example.org",
+            "@alice:example.org",
+            "DEVICE_B",
+            "sender-key-b",
+        ) not in adapter._prepared_e2ee_sessions
+
+    @pytest.mark.asyncio
+    async def test_text_retry_marks_the_preflight_device_snapshot(self):
+        from plugins.platforms.matrix.adapter import _ActiveE2EEDevice
+
+        adapter = _make_adapter()
+        adapter._encryption = True
+        device_a = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="DEVICE_A",
+            sender_key="sender-key-a",
+            seen_at=time.time(),
+        )
+        device_b = _ActiveE2EEDevice(
+            user_id="@alice:example.org",
+            device_id="DEVICE_B",
+            sender_key="sender-key-b",
+            seen_at=time.time(),
+        )
+        adapter._active_e2ee_devices["!room:example.org"] = device_a
+        adapter._prepare_outbound_e2ee = AsyncMock(return_value=device_a)
+        session = MagicMock(id="retry-session", shared=True, expired=False)
+        crypto_store = MagicMock()
+        crypto_store.get_outbound_group_session = AsyncMock(return_value=session)
+        crypto = MagicMock(crypto_store=crypto_store)
+        crypto.share_keys = AsyncMock()
+        client = MagicMock(crypto=crypto)
+
+        async def send_message_event(*args):
+            if client.send_message_event.await_count == 1:
+                adapter._active_e2ee_devices["!room:example.org"] = device_b
+                raise Exception("encryption error")
+            return "$retry-event"
+
+        client.send_message_event = AsyncMock(side_effect=send_message_event)
+        client.api.session.close = AsyncMock()
+        adapter._client = client
+        guard = MagicMock(returncode=0)
+        guard.communicate = AsyncMock(return_value=(b"", b""))
+
+        with patch(
+            "plugins.platforms.matrix.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=guard),
+        ):
+            result = await adapter.send("!room:example.org", "hello")
+
+        assert result.success is True
+        assert adapter._prepared_e2ee_sessions[
+            (
+                "!room:example.org",
+                "@alice:example.org",
+                "DEVICE_A",
+                "sender-key-a",
+            )
+        ] == "retry-session"
+        assert (
+            "!room:example.org",
+            "@alice:example.org",
+            "DEVICE_B",
+            "sender-key-b",
+        ) not in adapter._prepared_e2ee_sessions
+
+    @pytest.mark.asyncio
+    async def test_reliable_text_sends_are_serialized_per_room(self):
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def send_text_unlocked(*args, **kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            first_entered.set()
+            try:
+                await release.wait()
+                return MagicMock(success=True)
+            finally:
+                active -= 1
+
+        adapter._send_text_unlocked = AsyncMock(side_effect=send_text_unlocked)
+
+        first = asyncio.create_task(
+            adapter._send_reliable_text("!room:example.org", "first", None, None)
+        )
+        try:
+            await first_entered.wait()
+            second = asyncio.create_task(
+                adapter._send_reliable_text("!room:example.org", "second", None, None)
+            )
+            await asyncio.sleep(0.01)
+            assert max_active == 1
+        finally:
+            release.set()
+            if "second" in locals():
+                await asyncio.gather(first, second)
+            else:
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_reliable_events_are_serialized_per_room(self):
+        adapter = _make_adapter()
+        adapter._prepare_outbound_e2ee = AsyncMock()
+        adapter._mark_outbound_e2ee_prepared = AsyncMock()
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def send_message_event(*args):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            first_entered.set()
+            try:
+                await release.wait()
+                return "$event"
+            finally:
+                active -= 1
+
+        client = MagicMock()
+        client.send_message_event = AsyncMock(side_effect=send_message_event)
+        adapter._client = client
+
+        first = asyncio.create_task(
+            adapter._send_reliable_event("!room:example.org", "m.room.message", {})
+        )
+        await first_entered.wait()
+        second = asyncio.create_task(
+            adapter._send_reliable_event("!room:example.org", "m.room.message", {})
+        )
+        await asyncio.sleep(0.01)
+        try:
+            assert max_active == 1
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+
+    @pytest.mark.asyncio
+    async def test_media_event_fails_closed_when_e2ee_preflight_fails(self):
+        adapter = _make_adapter()
+        adapter._encryption = False
+        adapter._send_reliable_event = AsyncMock(
+            side_effect=RuntimeError("targeted E2EE rekey failed")
+        )
+        client = MagicMock()
+        client.upload_media = AsyncMock(return_value="mxc://example.org/file")
+        client.send_message_event = AsyncMock(return_value="$must-not-send")
+        adapter._client = client
+
+        result = await adapter._upload_and_send(
+            "!room:example.org",
+            b"content",
+            "file.txt",
+            "text/plain",
+            "m.file",
+        )
+
+        assert result.success is False
+        assert "targeted E2EE rekey failed" in result.error
+        client.send_message_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_simple_message_fails_closed_when_e2ee_preflight_fails(self):
+        adapter = _make_adapter()
+        adapter._send_reliable_event = AsyncMock(
+            side_effect=RuntimeError("targeted E2EE rekey failed")
+        )
+        client = MagicMock()
+        client.send_message_event = AsyncMock(return_value="$must-not-send")
+        adapter._client = client
+
+        result = await adapter._send_simple_message(
+            "!room:example.org", "notice", "m.notice"
+        )
+
+        assert result.success is False
+        assert "targeted E2EE rekey failed" in result.error
+        client.send_message_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_edit_fails_closed_when_e2ee_preflight_fails(self):
+        adapter = _make_adapter()
+        adapter._prepare_outbound_e2ee = AsyncMock(
+            side_effect=RuntimeError("targeted E2EE rekey failed")
+        )
+        client = MagicMock()
+        client.send_message_event = AsyncMock(return_value="$must-not-send")
+        adapter._client = client
+
+        result = await adapter.edit_message(
+            "!room:example.org", "$original", "updated"
+        )
+
+        assert result.success is False
+        assert "targeted E2EE rekey failed" in result.error
+        client.send_message_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_fails_closed_when_targeted_e2ee_rekey_fails(self):
+        adapter = _make_adapter()
+        adapter._prepare_outbound_e2ee = AsyncMock(
+            side_effect=RuntimeError("targeted E2EE rekey failed")
+        )
+        fake_client = MagicMock()
+        fake_client.send_message_event = AsyncMock(return_value="$must-not-send")
+        adapter._client = fake_client
+
+        result = await adapter.send("!room:example.org", "hello")
+
+        assert result.success is False
+        assert "targeted E2EE rekey failed" in result.error
+        fake_client.send_message_event.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_send_retries_after_e2ee_error(self):
         """send() should retry with crypto.share_keys() on E2EE errors."""
@@ -1605,6 +2868,7 @@ class TestMatrixEncryptedSendFallback:
         ])
         mock_crypto = MagicMock()
         mock_crypto.share_keys = AsyncMock()
+        mock_crypto.crypto_store.get_outbound_group_session = AsyncMock(return_value=None)
         fake_client.crypto = mock_crypto
         adapter._client = fake_client
 
@@ -1850,6 +3114,25 @@ class TestMatrixReactions:
         content = call_args.args[2] if len(call_args.args) > 2 else call_args.kwargs.get("content")
         assert content["m.relates_to"]["rel_type"] == "m.annotation"
         assert content["m.relates_to"]["key"] == "\U0001f44d"
+
+    @pytest.mark.asyncio
+    async def test_reaction_skips_e2ee_preflight_because_mautrix_does_not_encrypt_it(
+        self,
+    ):
+        self.adapter._send_reliable_event = AsyncMock(
+            side_effect=RuntimeError("must not run for an unencrypted reaction")
+        )
+        client = MagicMock()
+        client.send_message_event = AsyncMock(return_value="$reaction")
+        self.adapter._client = client
+
+        result = await self.adapter._send_reaction(
+            "!room:ex", "$event1", "\U0001f44d"
+        )
+
+        assert result == "$reaction"
+        self.adapter._send_reliable_event.assert_not_awaited()
+        client.send_message_event.assert_awaited_once()
 
 
     @pytest.mark.asyncio
@@ -2519,7 +3802,7 @@ class TestMatrixDmAutoThread:
         )
 
         assert ctx is not None
-        _body, _is_dm, _chat_type, thread_id, _display, _source = ctx
+        _body, _is_dm, _chat_type, thread_id, _display, _source, _is_mentioned = ctx
         assert thread_id == "$ev1"
 
 
@@ -2570,9 +3853,14 @@ class TestCreateMatrixSession:
 
 
 class TestMatrixDeadInviteHandling:
-    """Tests for _join_room_by_id auto-leaving dead/abandoned rooms.
+    """Tests for safe pending invites and abandoned-room cleanup.
 
-    Regression: when a room had no current members, ``join_room`` raised
+    Regression: pending-invite reconciliation used to schedule every room in
+    ``rooms.invite`` after the normal invite handler had already rejected an
+    unauthorized inviter. That bypassed sender authorization and joined the
+    bot to private rooms it must not enter.
+
+    Separately, when a room had no current members, ``join_room`` raised
     ``MUnknown: Can't join remote room because no servers that are in the
     room have been provided``. The pending invite stayed in the bot's view
     of the world, so every gateway restart re-attempted the join and
@@ -2583,6 +3871,35 @@ class TestMatrixDeadInviteHandling:
     def setup_method(self):
         self.adapter = _make_adapter()
         self.adapter._refresh_dm_cache = AsyncMock()
+
+    def test_unauthorized_pending_invite_is_not_scheduled(self):
+        self.adapter._allowed_user_ids = {"@owner:example.org"}
+        self.adapter._schedule_invite_join = MagicMock()
+        sync_data = {
+            "rooms": {
+                "invite": {
+                    "!private:example.org": {
+                        "invite_state": {
+                            "events": [
+                                {
+                                    "type": "m.room.member",
+                                    "sender": "@outsider:example.org",
+                                    "state_key": "@bot:example.org",
+                                    "content": {
+                                        "membership": "invite",
+                                        "is_direct": True,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+
+        self.adapter._schedule_pending_invite_joins(sync_data)
+
+        self.adapter._schedule_invite_join.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_servers_error_triggers_leave(self):
@@ -2735,7 +4052,7 @@ class TestMatrixReconnectDisconnect:
 
     @pytest.mark.asyncio
     async def test_connect_calls_disconnect_when_client_already_set(self):
-        """When self._client is set, connect() should call disconnect() first."""
+        """Reconnect closes the old client inside the held lifecycle lock."""
         adapter = _make_adapter()
 
         adapter._client = MagicMock()
@@ -2744,7 +4061,7 @@ class TestMatrixReconnectDisconnect:
         adapter._client.api.session.close = AsyncMock()
         adapter._client.whoami = AsyncMock()
 
-        adapter.disconnect = AsyncMock()
+        adapter._disconnect_unlocked = AsyncMock()
 
         fake_mautrix_mods = _make_fake_mautrix()
 
@@ -2774,7 +4091,7 @@ class TestMatrixReconnectDisconnect:
                 with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
                     await adapter.connect()
 
-        adapter.disconnect.assert_awaited_once()
+        adapter._disconnect_unlocked.assert_awaited_once()
 
 
 class TestDeviceIdRecoveryOnReconnect:
@@ -2939,24 +4256,54 @@ class TestMatrixDispatchSyncIsolation:
 
 
 # ---------------------------------------------------------------------------
-# E2EE crypto store reset on device change
+# E2EE crypto store/device mismatch must fail closed
 # ---------------------------------------------------------------------------
 
-class TestCryptoStoreResetOnDeviceChange:
+class TestCryptoStoreDeviceMismatch:
     @pytest.mark.asyncio
-    async def test_reset_when_device_id_changed(self, caplog):
+    async def test_mismatch_refuses_without_store_reset(self, caplog):
         import logging
         adapter = _make_adapter()
         store = MagicMock()
         store.get_device_id = AsyncMock(return_value="OLDDEVICE")
         store.delete = AsyncMock()
 
-        with caplog.at_level(logging.WARNING):
-            reset = await adapter._reset_crypto_store_if_device_changed(store, "NEWDEVICE")
+        with caplog.at_level(logging.ERROR), pytest.raises(
+            RuntimeError, match="crypto-store device mismatch"
+        ):
+            await adapter._reset_crypto_store_if_device_changed(store, "NEWDEVICE")
 
-        assert reset is True
-        store.delete.assert_awaited_once()
-        assert "OLDDEVICE" in caplog.text and "NEWDEVICE" in caplog.text
+        store.delete.assert_not_awaited()
+        assert "without changing the store" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_server_identity_mismatch_never_deletes_or_reuploads(self, caplog):
+        import logging
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.mxid = "@bot:example.org"
+        client.device_id = "DEVICE"
+        client.query_keys = AsyncMock(
+            return_value=MagicMock(
+                device_keys={
+                    "@bot:example.org": {
+                        "DEVICE": MagicMock(keys={"ed25519:DEVICE": "server-key"})
+                    }
+                }
+            )
+        )
+        client.api = MagicMock()
+        client.api.request = AsyncMock()
+        olm = MagicMock()
+        olm.account.identity_keys = {"ed25519": "local-key"}
+        olm.share_keys = AsyncMock()
+
+        with caplog.at_level(logging.ERROR):
+            assert await adapter._verify_device_keys_on_server(client, olm) is False
+
+        client.api.request.assert_not_awaited()
+        olm.share_keys.assert_not_awaited()
+        assert "without deleting the device" in caplog.text
 
     @pytest.mark.asyncio
     async def test_no_reset_when_device_id_same(self):
@@ -2989,17 +4336,10 @@ class TestCryptoStoreResetOnDeviceChange:
         store.delete.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_connect_resets_store_when_token_device_differs_from_config(
+    async def test_connect_refuses_when_token_device_differs_from_store(
         self, caplog
     ):
-        """Rotated token, stale MATRIX_DEVICE_ID.
-
-        Persisted store device is A, MATRIX_DEVICE_ID is still A, but the
-        access token now belongs to device B. The helper alone cannot catch
-        this: connect() used to resolve client.device_id to the configured A,
-        so persisted A == live A and no reset happened. The token's device
-        must win, and the store must be reset.
-        """
+        """A rotated token plus stale store must not trigger an automatic reset."""
         import logging
         from plugins.platforms.matrix.adapter import MatrixAdapter
 
@@ -3081,7 +4421,7 @@ class TestCryptoStoreResetOnDeviceChange:
 
         import plugins.platforms.matrix.adapter as matrix_mod
 
-        with caplog.at_level(logging.WARNING), patch.object(
+        with caplog.at_level(logging.ERROR), patch.object(
             matrix_mod, "_check_e2ee_deps", return_value=True
         ), patch.dict("sys.modules", fake_mautrix_mods), patch.object(
             adapter, "_refresh_dm_cache", AsyncMock()
@@ -3090,15 +4430,11 @@ class TestCryptoStoreResetOnDeviceChange:
         ), patch.object(
             adapter, "_verify_device_keys_on_server", AsyncMock(return_value=True)
         ):
-            assert await adapter.connect() is True
+            assert await adapter.connect() is False
 
-        # The token's device wins over the stale configured one.
         assert mock_client.device_id == "DEVICE_B"
-        # ...which is what lets the mismatch be seen and the store reset.
-        assert deleted["count"] == 1
-        assert "MATRIX_DEVICE_ID=DEVICE_A" in caplog.text
-
-        await adapter.disconnect()
+        assert deleted["count"] == 0
+        assert "without changing the store" in caplog.text
 
 
 # ---------------------------------------------------------------------------

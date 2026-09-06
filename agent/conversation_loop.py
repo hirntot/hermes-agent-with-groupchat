@@ -7541,6 +7541,18 @@ def run_conversation(
                     except Exception:
                         pass
             
+            _matrix_info_only_marker = (
+                "[Relevanz-Einschätzung: Nur zur Info, du brauchst "
+                "nicht darauf zu antworten.]"
+            )
+            _matrix_info_only_turn = (
+                agent.platform == "matrix"
+                and isinstance(original_user_message, str)
+                and original_user_message.rstrip().endswith(
+                    _matrix_info_only_marker
+                )
+            )
+
             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
             if has_incomplete_scratchpad(assistant_message.content or ""):
@@ -7575,6 +7587,28 @@ def run_conversation(
             agent._incomplete_scratchpad_retries = 0
 
             if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
+                if (
+                    _matrix_info_only_turn
+                    and not agent._strip_think_blocks(
+                        assistant_message.content or ""
+                    ).strip()
+                ):
+                    logger.info(
+                        "Incomplete Codex response on trusted Matrix info-only "
+                        "turn — accepting intentional silence after one model call"
+                    )
+                    agent._drop_trailing_empty_response_scaffolding(messages)
+                    assistant_msg = agent._build_assistant_message(
+                        assistant_message, "stop"
+                    )
+                    assistant_msg["content"] = "NO_REPLY"
+                    messages.append(assistant_msg)
+                    final_response = "NO_REPLY"
+                    finish_reason = "stop"
+                    agent._codex_incomplete_retries = 0
+                    _turn_exit_reason = "intentional_silence"
+                    break
+
                 agent._codex_incomplete_retries += 1
 
                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
@@ -8529,6 +8563,31 @@ def run_conversation(
                             "_empty_recovery_synthetic": True,
                         })
                         continue
+
+                    # Matrix info-only turns are intentionally read-only context.
+                    # The provider must still run once so it can process the
+                    # information and the turn is retained in session history.
+                    # If that completed turn has no visible content, accept it
+                    # as deliberate silence instead of treating it as a provider
+                    # failure and emitting retries/fallback warnings.
+                    if (
+                        _matrix_info_only_turn
+                        and not agent._strip_think_blocks(final_response).strip()
+                    ):
+                        logger.info(
+                            "Empty response on trusted Matrix info-only turn — "
+                            "accepting intentional silence after one model call"
+                        )
+                        agent._drop_trailing_empty_response_scaffolding(messages)
+                        assistant_msg = agent._build_assistant_message(
+                            assistant_message, "stop"
+                        )
+                        assistant_msg["content"] = "NO_REPLY"
+                        messages.append(assistant_msg)
+                        final_response = "NO_REPLY"
+                        finish_reason = "stop"
+                        _turn_exit_reason = "intentional_silence"
+                        break
 
                     # ── Thinking-only prefill continuation ──────────
                     # The model produced structured reasoning (via API

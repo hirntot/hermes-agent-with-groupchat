@@ -3319,6 +3319,7 @@ class TestAssistantThreadLifecycle:
 
         runner = object.__new__(GatewayRunner)
         assert runner._thread_metadata_for_source(msg_event.source) == {
+            "conversation": {"platform": "slack", "chat_id": "D123", "scope_id": "T_OTHER", "thread_id": "171.111"},
             "thread_id": "171.111",
             "slack_team_id": "T_OTHER",
             # R3-5: per-turn egress identity stamped from THIS turn's source

@@ -485,6 +485,48 @@ class GatewayAuthorizationMixin:
             return any(str(item).strip() for item in sender_allow)
         return False
 
+    def _room_scoped_sender_is_allowed(
+        self,
+        source: SessionSource,
+        *,
+        profile: Optional[str] = None,
+    ) -> bool:
+        """Authorize a sender only for one configured group room.
+
+        ``platforms.<platform>.groups.<chat_id>.allow_from`` is a narrow union
+        with the platform-wide allowlist. It applies only to group/forum/channel
+        traffic and therefore never grants DM access.
+        """
+        if (
+            source.chat_type not in {"group", "forum", "channel"}
+            or not source.chat_id
+            or not source.user_id
+            or not source.platform
+        ):
+            return False
+
+        adapter = self._authorization_adapter(source.platform, profile)
+        groups = getattr(adapter, "_groups", None) if adapter is not None else None
+        if groups is None:
+            config = getattr(self, "config", None)
+            platform_cfg = (
+                config.platforms.get(source.platform)
+                if config is not None and hasattr(config, "platforms")
+                else None
+            )
+            extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+            if isinstance(extra, dict):
+                groups = extra.get("groups")
+        if not isinstance(groups, dict):
+            return False
+
+        group_cfg = groups.get(str(source.chat_id))
+        if not isinstance(group_cfg, dict):
+            return False
+        sender_allow = group_cfg.get("allow_from") or group_cfg.get("allowFrom")
+        allowed = _coerce_allow_set(sender_allow)
+        return bool(allowed and ("*" in allowed or source.user_id in allowed))
+
     def _pairing_store_for(self, source: "SessionSource"):
         """Pick the per-profile PairingStore for a source, falling back to global.
 
@@ -628,6 +670,15 @@ class GatewayAuthorizationMixin:
 
         if not user_id:
             return False
+
+        # Exact room-scoped sender authorization is deliberately checked before
+        # platform-wide allowlists. It is a narrow union for group traffic only;
+        # the same user remains unauthorized in DMs and in every other room.
+        if self._room_scoped_sender_is_allowed(
+            source,
+            profile=adapter_profile,
+        ):
+            return True
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",

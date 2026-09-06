@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            pass
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -3608,6 +3611,70 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert agent.session_api_calls == 2
         assert caplog.text.count("usage=unavailable") == 2
+
+    def test_matrix_info_only_empty_response_is_intentional_silence(self, agent):
+        """A trusted Matrix info-only turn is processed once, then stays silent."""
+        self._setup_agent(agent)
+        agent.platform = "matrix"
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        agent._fallback_chain = [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+        ]
+        empty_resp = _mock_response(content=None, finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [empty_resp] * 4
+        user_message = (
+            "Statusmeldung: Die Wartung ist abgeschlossen.\n\n"
+            "[Relevanz-Einschätzung: Nur zur Info, du brauchst nicht darauf zu "
+            "antworten.]"
+        )
+        with (
+            patch("agent.conversation_loop.jittered_backoff", return_value=0),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent, "_try_activate_fallback", return_value=False
+            ) as mock_fallback,
+        ):
+            result = agent.run_conversation(user_message)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "NO_REPLY"
+        assert result["api_calls"] == 1
+        assert result["turn_exit_reason"] == "intentional_silence"
+        assert agent.client.chat.completions.create.call_count == 1
+        mock_fallback.assert_not_called()
+
+    def test_matrix_info_only_reasoning_only_response_is_intentional_silence(
+        self, agent
+    ):
+        """Reasoning proves processing; info-only still ends after one call."""
+        self._setup_agent(agent)
+        agent.platform = "matrix"
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        reasoning_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content="I processed the status update.",
+        )
+        agent.client.chat.completions.create.return_value = reasoning_resp
+        user_message = (
+            "Statusmeldung: Die Wartung ist abgeschlossen.\n\n"
+            "[Relevanz-Einschätzung: Nur zur Info, du brauchst nicht darauf zu "
+            "antworten.]"
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(user_message)
+
+        assert result["completed"] is True
+        assert result["final_response"] == "NO_REPLY"
+        assert result["api_calls"] == 1
+        assert result["turn_exit_reason"] == "intentional_silence"
+        assert agent.client.chat.completions.create.call_count == 1
 
     def test_truly_empty_response_succeeds_on_nudge(self, agent):
         """Model produces content after being nudged for empty response."""

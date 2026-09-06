@@ -15,6 +15,7 @@ import time
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
+from tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -511,7 +512,7 @@ def _handle_send(args):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success") and mirror_text:
+        if isinstance(result, dict) and result.get("success") and not result.get("suppressed") and mirror_text:
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
@@ -1109,6 +1110,10 @@ async def _send_via_adapter(
     }
 
 
+from gateway.conversation import conversation_standalone
+
+
+@conversation_standalone
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
     """Route a message to the appropriate platform sender.
 
@@ -2497,3 +2502,13 @@ from tools.registry import tool_error
 #   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
 # Those callers import the helpers directly; none of them need the registry
 # entry.
+
+
+# Expose send_message as an agent-callable tool for the Matrix platform.
+# This intentionally gates the tool to hermes-matrix only, not the core set.
+registry.register(
+    name="send_message",
+    toolset="hermes-matrix",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+)

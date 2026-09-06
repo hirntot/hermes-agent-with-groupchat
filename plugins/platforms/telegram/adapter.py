@@ -597,6 +597,7 @@ _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
 )
 
 
+
 class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
@@ -11020,6 +11021,7 @@ class TelegramAdapter(BasePlatformAdapter):
             raw_message=message,
             message_id=str(message.message_id),
             platform_update_id=update_id,
+            metadata={"conversation_mentioned": bool(getattr(self, "_bot", None)) and self._message_mentions_bot(message)},
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,

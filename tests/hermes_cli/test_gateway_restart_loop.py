@@ -659,6 +659,43 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    @pytest.mark.parametrize("command", [
+        "systemd-run --user --on-active=10s /tmp/repair.sh",
+        "/usr/bin/systemd-run --user --unit neutral-health-job /bin/true",
+    ])
+    def test_blocks_systemd_run_inside_gateway(self, monkeypatch, command):
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 1
+        assert "systemd-run" in result["error"]
+
+    def test_systemd_run_allowed_outside_gateway(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=False)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = "systemd-run --user --on-active=10s /tmp/admin-job.sh"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
     def test_cli_agent_session_not_blocked_by_inherited_env(
         self, monkeypatch
     ):
@@ -677,10 +714,6 @@ class TestTerminalToolGatewayLifecycleGuard:
                 calls.append(cmd)
                 return {"output": "", "returncode": 0}
 
-        # Simulate a CLI agent session: _HERMES_GATEWAY=1 is in the
-        # environment (inherited from the gateway), but
-        # _is_supervised_gateway_process() returns False because the
-        # process does not own the gateway PID file.
         self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=False)
         monkeypatch.setenv("_HERMES_GATEWAY", "1")
         monkeypatch.setattr(

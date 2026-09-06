@@ -86,6 +86,18 @@ RECONNECTED_MARKER = (
 # adapter reconnected.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 
+# These are gateway control-plane acknowledgements, not agent output. They
+# are cheap to regenerate and, more importantly, replaying one after restart
+# can turn a busy group chat into a peer-agent feedback loop.
+_NON_DURABLE_GATEWAY_NOTICES = frozenset({
+    "⏳ Gateway is restarting and is not accepting new work right now.",
+    "⏳ Gateway is shutting down and is not accepting new work right now.",
+})
+
+
+def _is_non_durable_gateway_notice(content: str) -> bool:
+    return str(content or "").strip() in _NON_DURABLE_GATEWAY_NOTICES
+
 
 def _db_path():
     return get_hermes_home() / "state.db"
@@ -241,6 +253,8 @@ def record_obligation(
     adapter_profile: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
+    if _is_non_durable_gateway_notice(content):
+        return
     now = time.time()
     stored_profile = str(adapter_profile).strip() if adapter_profile else "default"
     pid, started = _owner_stamp()
@@ -346,6 +360,15 @@ def sweep_recoverable(
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
              adapter_profile) in rows:
+            if _is_non_durable_gateway_notice(content):
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?,
+                           last_error='non-durable gateway notice'
+                       WHERE obligation_id=?""",
+                    (now, oid),
+                )
+                continue
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:

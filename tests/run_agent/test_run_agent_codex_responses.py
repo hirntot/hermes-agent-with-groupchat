@@ -1826,6 +1826,31 @@ def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"
     )
 
 
+def test_codex_incomplete_info_only_response_is_intentional_silence(monkeypatch):
+    """An info-only reasoning response is processed once, not continued thrice."""
+    agent = _build_agent(monkeypatch)
+    agent.platform = "matrix"
+    response = _codex_incomplete_with_reasoning("")
+    calls = {"count": 0}
+
+    def _return_incomplete(_api_kwargs):
+        calls["count"] += 1
+        return response
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _return_incomplete)
+    result = agent.run_conversation(
+        "Statusmeldung: Die Wartung ist abgeschlossen.\n\n"
+        "[Relevanz-Einschätzung: Nur zur Info, du brauchst nicht darauf zu "
+        "antworten.]"
+    )
+
+    assert result["completed"] is True
+    assert result["final_response"] == "NO_REPLY"
+    assert result["api_calls"] == 1
+    assert result["turn_exit_reason"] == "intentional_silence"
+    assert calls["count"] == 1
+
+
 def test_codex_incomplete_visible_dedup_suppresses_duplicate_interims(monkeypatch):
     """Two consecutive incomplete responses with identical visible content
     but different opaque reasoning items should be collapsed — only the first

@@ -3,6 +3,13 @@
 </p>
 
 # Hermes Agent ☤
+
+> **Experimental downstream build:** this branch adds transport-independent
+> multi-agent group-chat coordination to Hermes Agent 0.21.0. It is a
+> community-maintained fork and not an official Nous Research release. Start with
+> [GROUPCHAT_FORK.md](GROUPCHAT_FORK.md) and the
+> [Groupchat addon documentation](plugins/groupchat/README.md).
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>

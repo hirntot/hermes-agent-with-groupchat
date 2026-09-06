@@ -10,7 +10,7 @@ clear-on-blank behavior added in the follow-up to PR #58421.
 import hermes_cli.config as config_mod
 import hermes_cli.cli_output as cli_output_mod
 import tools.lazy_deps as lazy_deps_mod
-from plugins.platforms.matrix.adapter import interactive_setup
+from plugins.platforms.matrix.adapter import _apply_yaml_config, interactive_setup
 
 
 def _patch_setup_io(monkeypatch, prompts, yes_no_responses, saved, removed, existing):
@@ -81,3 +81,14 @@ class TestMatrixHomeChannelClear:
         assert "MATRIX_HOME_ROOM" not in saved
 
 
+def test_matrix_yaml_groups_are_seeded_into_profile_config(monkeypatch):
+    monkeypatch.delenv("MATRIX_ROOM_ALLOWED_USERS", raising=False)
+    groups = {
+        "!website-seo-room": {
+            "allow_from": ["@outsider:example.org"],
+        },
+    }
+
+    seeded = _apply_yaml_config({}, {"groups": groups})
+
+    assert seeded == {"groups": groups}

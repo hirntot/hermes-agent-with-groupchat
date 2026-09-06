@@ -95,6 +95,17 @@ def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
                 })
 
 
+    # Local migration: retired homeserver sessions remain searchable history,
+    # but must never reappear as current send targets (including threads).
+    matrix_entries = platforms.get("matrix")
+    if isinstance(matrix_entries, list):
+        platforms["matrix"] = [
+            entry for entry in matrix_entries
+            if str(entry.get("id", "")).split(":$", 1)[0].rsplit(":", 1)[-1].lower()
+            != "nope.chat"
+        ]
+
+
 def _normalize_channel_query(value: str) -> str:
     return value.lstrip("#").strip().lower()
 

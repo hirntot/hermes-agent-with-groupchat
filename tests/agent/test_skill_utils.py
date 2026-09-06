@@ -177,6 +177,23 @@ def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
     assert is_excluded_skill_path(package / "SKILL.md") is True
 
 
+def test_iter_skill_index_files_prunes_restore_backups(tmp_path):
+    active = tmp_path / "category" / "current"
+    active.mkdir(parents=True)
+    (active / "SKILL.md").write_text(
+        "---\nname: current\n---\n", encoding="utf-8"
+    )
+    restored = tmp_path / ".restore-backups" / "snapshot" / "old"
+    restored.mkdir(parents=True)
+    archived_skill = restored / "SKILL.md"
+    archived_skill.write_text("---\nname: old\n---\n", encoding="utf-8")
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [
+        active / "SKILL.md"
+    ]
+    assert is_excluded_skill_path(archived_skill) is True
+
+
 def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     """A category named scripts/templates/assets/references is still valid."""
     scripts_skill = tmp_path / "scripts" / "bash-helper"
@@ -381,4 +398,3 @@ class TestBOMToleranceSiblingSites:
         fm = _split_frontmatter("\ufeff---\nname: bp\n---\nbody")
         assert fm is not None
         assert fm.get("name") == "bp"
-

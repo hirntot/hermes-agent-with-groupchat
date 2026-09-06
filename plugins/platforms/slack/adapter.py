@@ -315,6 +315,7 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 
 
 @dataclass
+
 class _ThreadContextCache:
     """Cache entry for fetched thread context."""
 
@@ -7149,6 +7150,7 @@ class SlackAdapter(BasePlatformAdapter):
             reply_to_text=None,
             auto_skill=_auto_skill,
             metadata={
+                "conversation_mentioned": is_mentioned,
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
