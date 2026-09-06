@@ -61,6 +61,7 @@ def get_settings(profile: str | None = None):
                 "defaults": validate_settings({}),
                 "available_platforms": available_platforms(),
                 "decision_log_directory": str(Path(get_hermes_home()) / "logs"),
+                "persistent_context_directory": str(Path(get_hermes_home()) / "groupchat"),
                 "decision_logs": {platform: log_paths(get_hermes_home(), platform)
                                   for platform in available_platforms()},
                 "groupchat_participation": groupchat_participation(),

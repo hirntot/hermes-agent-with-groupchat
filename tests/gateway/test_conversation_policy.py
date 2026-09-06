@@ -134,6 +134,7 @@ def test_host_suppressed_output_is_audited_without_message_body(tmp_path):
 def test_api_exposes_selected_profile_log_paths(tmp_path):
     from plugins.groupchat.dashboard.plugin_api import get_settings
     data = get_settings(profile="current")
+    assert data["persistent_context_directory"] == str(tmp_path / "groupchat")
     assert data["decision_logs"]["matrix"]["relevance"] == str(tmp_path / "logs/matrix-relevance-decisions.jsonl")
     assert data["decision_logs"]["slack"]["pingpong"] == str(tmp_path / "logs/slack-groupchat-outbound.jsonl")
 
@@ -474,6 +475,44 @@ async def test_each_latest_message_is_scored_separately_with_recent_context(tmp_
     assert "Social campaign draft one" in (adapter.delivered[0].channel_context or "")
     assert "same-room" not in gate._passive_context
     await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_passive_context_survives_restart_and_is_consumed_after_dispatch(
+    tmp_path
+):
+    settings = {
+        "relevance": {"enabled": True},
+        "pingpong_guard": {"enabled": False},
+    }
+    first = Adapter(Platform.MATRIX, settings)
+    first_gate = first.conversation_policy().relevance
+    first_gate._throttled_evaluate = AsyncMock(return_value=(1, "Passive context."))
+    context_event = event(Platform.MATRIX, text="Long-lived social campaign detail")
+    context_event.metadata["conversation_mentioned"] = False
+    await first.handle_message(context_event)
+
+    state_file = tmp_path / "groupchat" / "passive-context.matrix.json"
+    assert state_file.exists()
+    assert state_file.stat().st_mode & 0o777 == 0o600
+    assert state_file.parent.stat().st_mode & 0o777 == 0o700
+    persisted = json.loads(state_file.read_text())
+    assert persisted["rooms"]["same-room"][0]["text"] == context_event.text
+    await first.disconnect()
+
+    second = Adapter(Platform.MATRIX, settings)
+    second_gate = second.conversation_policy().relevance
+    assert second_gate._passive_context["same-room"][0].text == context_event.text
+    second_gate._throttled_evaluate = AsyncMock(return_value=(5, "Relevant now."))
+    trigger = event(Platform.MATRIX, text="What are the advertising implications?")
+    trigger.message_id = "restart-trigger"
+    trigger.metadata["conversation_mentioned"] = False
+    await second.handle_message(trigger)
+
+    assert len(second.delivered) == 1
+    assert context_event.text in (second.delivered[0].channel_context or "")
+    assert not state_file.exists()
+    await second.disconnect()
 
 
 @pytest.mark.asyncio

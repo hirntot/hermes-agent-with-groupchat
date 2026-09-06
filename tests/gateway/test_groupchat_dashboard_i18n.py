@@ -27,6 +27,7 @@ def test_log_directory_tracks_selected_profile(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / selected[-1])
     for profile in ("first", "second"):
         assert get_settings(profile)["decision_log_directory"] == str(tmp_path / profile / "logs")
+        assert get_settings(profile)["persistent_context_directory"] == str(tmp_path / profile / "groupchat")
     assert not (tmp_path / "first").exists()
 
 
@@ -76,9 +77,10 @@ const draft = {enabled:false, platforms:["matrix"],
  pingpong_guard:{enabled:true,min_chars:60}};
 const states = ["current", [], draft, draft, false, "saved", "", null,
  "/test/profile/logs", ["matrix", "mattermost", "discord"],
- [{profile:"bastian_kern",require_mention:false,groupchat_enabled:true,participates:true},{profile:"lena_brandner",require_mention:true,groupchat_enabled:false,participates:false}]];
+ [{profile:"bastian_kern",require_mention:false,groupchat_enabled:true,participates:true},{profile:"lena_brandner",require_mention:true,groupchat_enabled:false,participates:false}],
+ "/test/profile/groupchat"];
 const sdk = {React:{createElement:(tag,props,...children)=>({tag,props,children}),Fragment:"fragment"},
- api:{getProfiles:()=>Promise.resolve({profiles:[]})},fetchJSON:()=>Promise.resolve({settings:draft,decision_log_directory:"/test/profile/logs",groupchat_participation:states[10]}),
+ api:{getProfiles:()=>Promise.resolve({profiles:[]})},fetchJSON:()=>Promise.resolve({settings:draft,decision_log_directory:"/test/profile/logs",persistent_context_directory:"/test/profile/groupchat",groupchat_participation:states[10]}),
  hooks:{useState:()=>[states[cursor++],()=>{}],useEffect:fn=>{fn();}},
  useI18n:()=>({locale})};
 const context = {window:{__HERMES_PLUGIN_SDK__:sdk,__HERMES_PLUGINS__:{register:(name,fn)=>{assert.equal(name,"groupchat");component=fn;}}}};
@@ -94,6 +96,9 @@ assert.match(text,/lena_brandner.*require_mention=.*true.*Groupchat off/);
 assert.match(text,/Decision logs/);
 assert.match(text,/Log directory/);
 assert.equal((text.match(/\/test\/profile\/logs/g) || []).length, 1);
+assert.match(text,/Persistent score-1 context directory/);
+assert.equal((text.match(/\/test\/profile\/groupchat/g) || []).length, 1);
+assert.match(text,/developed by RechnerLotsen/);
 assert.doesNotMatch(text,/matrix-groupchat-outbound.jsonl/);
 states[8]="/test/another-profile/logs";
 assert.match(render(),/\/test\/another-profile\/logs/);
@@ -107,6 +112,8 @@ locale="de";text=render();
 assert.match(text,/Groupchat aktivieren/);
 assert.match(text,/Entscheidungslogs/);
 assert.match(text,/Log-Verzeichnis/);
+assert.match(text,/dauerhaften Stufe-1-Kontext/);
+assert.match(text,/von RechnerLotsen entwickelt/);
 assert.match(text,/Matrix-Teilnahme/);
 assert.match(text,/bastian_kern.*require_mention=.*false.*aktiv/);
 assert.match(text,/Primär Modell/);

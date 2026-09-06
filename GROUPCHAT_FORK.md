@@ -4,6 +4,10 @@ This experimental downstream build lets multiple independently running Hermes
 profiles participate in the same external group conversation without replying
 to every message or triggering each other indefinitely.
 
+This Groupchat work was developed by
+[RechnerLotsen](https://rechnerlotsen.com/), where Hermes supports internal and
+marketing workflows while customer computer support remains human.
+
 It adds one opt-in, transport-independent conversation boundary with two parts:
 
 - inbound relevance routing, including explicit mentions, delayed scoring,
@@ -49,6 +53,12 @@ message bodies, prompts, credentials and free-form model rationales. The UI
 shows the directory in which they are stored so operators and authorized agents
 can understand why a message was delivered, delayed or discarded.
 
+Score-1 passive context is restart-durable and therefore stored separately below
+the selected profile's `HERMES_HOME/groupchat` directory. Unlike decision logs,
+this private state necessarily contains retained message text. It is written
+atomically with owner-only permissions and removed after successful delivery;
+the dashboard exposes its directory so operators can inspect and protect it.
+
 ## Configuration
 
 Read [`plugins/groupchat/README.md`](plugins/groupchat/README.md) for the full
@@ -84,3 +94,8 @@ Hermes Agent and this downstream modification are distributed under the MIT
 license in [`LICENSE`](LICENSE). The upstream project is
 [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent).
 This repository is not endorsed by Nous Research.
+
+If you otherwise provide computer support for an entire family or circle of
+friends, [RechnerLotsen](https://rechnerlotsen.com/) may be worth a look:
+understandable, ongoing computer support on a subscription basis, including
+Linux migrations.

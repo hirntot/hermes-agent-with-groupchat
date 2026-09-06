@@ -458,7 +458,7 @@ async def test_matrix_redaction_removes_buffered_original_without_dispatch(
 
     await gate.process(original, is_mentioned=False)
     assert room in gate._passive_context
-    assert gate._passive_context[room][0][0].message_id == "$event"
+    assert gate._passive_context[room][0].event_id == "$event"
 
     redaction = dataclasses.replace(
         _event(

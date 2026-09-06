@@ -197,6 +197,16 @@ class _RelevanceContext:
     rooms: Dict[str, _RoomContext] = dataclasses.field(default_factory=dict)
 
 
+@dataclasses.dataclass
+class _PassiveContextEntry:
+    sender: str
+    text: str
+    timestamp: float
+    event_id: Optional[str] = None
+    reply_to_event_id: Optional[str] = None
+    peer_targeted: bool = False
+
+
 class _PendingBuffer:
     __slots__ = ("events", "task", "last_score", "last_rationale", "last_typing_at")
     def __init__(self):
@@ -303,9 +313,14 @@ class IntelligentReactionGate:
         self._pending: Dict[str, _PendingBuffer] = {}
         # Score-1 events have no timer. They remain passive context until an
         # independently relevant event is dispatched to the agent.
-        self._passive_context: Dict[str, List[Tuple[MessageEvent, float]]] = (
+        self._passive_context_file = (
+            self._profile_dir / "groupchat" / f"passive-context.{platform}.json"
+        )
+        self._passive_context: Dict[str, List[_PassiveContextEntry]] = (
             passive_context if passive_context is not None else {}
         )
+        if not self._passive_context:
+            self._passive_context.update(self._load_passive_context())
         self._mentioned_event_ids: Dict[str, Set[str]] = {}
         # Messages explicitly addressed to another local Groupchat profile.
         # Replies to these stay context-only unless this agent is mentioned.
@@ -314,6 +329,12 @@ class IntelligentReactionGate:
             if peer_targeted_event_ids is not None
             else {}
         )
+        for context_room, entries in self._passive_context.items():
+            self._peer_targeted_event_ids.setdefault(context_room, set()).update(
+                entry.event_id
+                for entry in entries
+                if entry.peer_targeted and entry.event_id
+            )
         # Track message IDs sent by this agent so replies to them are treated
         # as thread continuations (a user replying to the agent's own message
         # is effectively addressing the agent, even without an @-mention).
@@ -945,9 +966,11 @@ class IntelligentReactionGate:
                         return
             passive = self._passive_context.get(room)
             if passive:
-                for i, (event, ts) in enumerate(passive):
-                    if event.message_id == edited_original_event_id:
-                        passive[i] = (dataclasses.replace(event, text=new_text), _now())
+                for entry in passive:
+                    if entry.event_id == edited_original_event_id:
+                        entry.text = new_text
+                        entry.timestamp = _now()
+                        self._persist_passive_context()
                         self._audit(
                             msg_event,
                             phase="decision",
@@ -985,12 +1008,12 @@ class IntelligentReactionGate:
             passive = self._passive_context.get(room)
             if passive is not None:
                 self._passive_context[room] = [
-                    (event, queued_at)
-                    for event, queued_at in passive
-                    if event.message_id != original_event_id
+                    entry for entry in passive
+                    if entry.event_id != original_event_id
                 ]
                 if not self._passive_context[room]:
                     self._passive_context.pop(room, None)
+                self._persist_passive_context()
             self._audit(
                 msg_event,
                 phase="decision",
@@ -1062,7 +1085,9 @@ class IntelligentReactionGate:
                 self._peer_targeted_event_ids.setdefault(room, set()).add(
                     msg_event.message_id
                 )
-            self._retain_passive_context(room, msg_event, sender)
+            self._retain_passive_context(
+                room, msg_event, sender, peer_targeted=True
+            )
             self._audit(
                 msg_event,
                 phase="decision",
@@ -1089,7 +1114,9 @@ class IntelligentReactionGate:
                 buffered_count=len(self._passive_context.get(room, [])) + 1,
                 dispatch_attempted=False,
             )
-            self._retain_passive_context(room, msg_event, sender)
+            self._retain_passive_context(
+                room, msg_event, sender, peer_targeted=True
+            )
             return
 
         if is_mentioned:
@@ -1492,6 +1519,7 @@ class IntelligentReactionGate:
         # Passive context is consumed only after dispatch was accepted. A
         # failed dispatch keeps it available for the next attempt.
         self._passive_context.pop(room, None)
+        self._persist_passive_context()
 
         # No need to wait for read receipts, but avoid unhandled task warnings
         # by briefly waiting for all of them if they did not fail.
@@ -1518,10 +1546,24 @@ class IntelligentReactionGate:
             self._room_transcript[room] = transcript[-self._max_transcript_entries :]
 
     def _retain_passive_context(
-        self, room: str, event: MessageEvent, sender: str
+        self,
+        room: str,
+        event: MessageEvent,
+        sender: str,
+        *,
+        peer_targeted: bool = False,
     ) -> None:
         """Keep a score-1 event without scheduling an agent turn."""
-        self._passive_context.setdefault(room, []).append((event, _now()))
+        self._passive_context.setdefault(room, []).append(
+            _PassiveContextEntry(
+                sender=sender,
+                text=event.text or "",
+                timestamp=_now(),
+                event_id=event.message_id,
+                reply_to_event_id=event.reply_to_message_id,
+                peer_targeted=peer_targeted,
+            )
+        )
         self._record_transcript(
             room,
             sender=sender,
@@ -1529,6 +1571,7 @@ class IntelligentReactionGate:
             timestamp=_now(),
             event_id=event.message_id,
         )
+        self._persist_passive_context()
 
     def _passive_context_for_agent(self, room: str) -> str:
         events = self._passive_context.get(room, [])
@@ -1538,10 +1581,103 @@ class IntelligentReactionGate:
             "Passive room context retained from earlier score-1 messages "
             "(context only; do not answer them retroactively):"
         ]
-        for event, _ in events:
-            sender = event.user_name or event.user_id or "?"
-            lines.append(f"{sender}: {event.text}")
+        for entry in events:
+            lines.append(f"{entry.sender}: {entry.text}")
         return "\n".join(lines)
+
+    def _load_passive_context(self) -> Dict[str, List[_PassiveContextEntry]]:
+        """Load private restart-durable score-1 context; fail closed to empty."""
+        try:
+            raw = json.loads(self._passive_context_file.read_text(encoding="utf-8"))
+            if raw.get("version") != 1 or not isinstance(raw.get("rooms"), dict):
+                raise ValueError("unsupported passive context format")
+            result: Dict[str, List[_PassiveContextEntry]] = {}
+            for room, values in raw["rooms"].items():
+                if not isinstance(room, str) or not isinstance(values, list):
+                    continue
+                entries = []
+                for value in values:
+                    if not isinstance(value, dict) or not isinstance(value.get("text"), str):
+                        continue
+                    entries.append(
+                        _PassiveContextEntry(
+                            sender=str(value.get("sender") or "?"),
+                            text=value["text"],
+                            timestamp=float(value.get("timestamp") or 0),
+                            event_id=str(value["event_id"]) if value.get("event_id") else None,
+                            reply_to_event_id=(
+                                str(value["reply_to_event_id"])
+                                if value.get("reply_to_event_id")
+                                else None
+                            ),
+                            peer_targeted=bool(value.get("peer_targeted", False)),
+                        )
+                    )
+                if entries:
+                    result[room] = entries
+            os.chmod(self._passive_context_file, 0o600)
+            return result
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            logger.warning(
+                "Conversation IR: could not load passive context (%s)",
+                type(exc).__name__,
+            )
+            return {}
+
+    def _persist_passive_context(self) -> None:
+        """Atomically persist score-1 context with owner-only permissions."""
+        try:
+            if not any(self._passive_context.values()):
+                self._passive_context_file.unlink(missing_ok=True)
+                self._fsync_passive_context_directory()
+                return
+            directory = self._passive_context_file.parent
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
+            payload = {
+                "version": 1,
+                "platform": self._platform,
+                "rooms": {
+                    room: [dataclasses.asdict(entry) for entry in entries]
+                    for room, entries in self._passive_context.items()
+                    if entries
+                },
+            }
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".passive-context-", suffix=".tmp", dir=directory
+            )
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, self._passive_context_file)
+                os.chmod(self._passive_context_file, 0o600)
+                self._fsync_passive_context_directory()
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning(
+                "Conversation IR: could not persist passive context (%s)",
+                type(exc).__name__,
+            )
+
+    def _fsync_passive_context_directory(self) -> None:
+        """Make a state-file replace/removal durable across abrupt restarts."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(self._passive_context_file.parent, flags)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def _voice_delay_for_room(self, room: str) -> float:
         """Return how long to wait before passing a voice message to the agent.

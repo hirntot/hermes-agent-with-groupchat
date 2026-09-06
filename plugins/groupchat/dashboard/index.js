@@ -18,6 +18,9 @@
     "logsRetention": "Each file rotates at 10 MiB to .jsonl.1 (one previous file retained; owner-only permissions). Outbound send means allowed by the filter, not confirmed delivery. Logs remain on the gateway server, not this browser’s computer.",
     "logDirectory": "Log directory",
     "logDirectoryHelp": "For the selected profile. Filenames identify the channel and filter; files are created when decisions are recorded.",
+    "contextDirectory": "Persistent score-1 context directory",
+    "contextDirectoryHelp": "Restart-durable private state is stored as passive-context.<channel>.json with owner-only permissions. It contains retained message text and is removed after successful delivery to the agent.",
+    "attribution": "Groupchat coordination was developed by RechnerLotsen.",
     "patterns": "Message patterns",
     "patternHelp": "One Python regular expression per line. Changes replace the defaults. Use ^...$ for a whole-message match. Empty lists disable these patterns, not AI checks or lifecycle handling. Only use trusted patterns; complex expressions can slow message processing.",
     "inboundPatterns": "System-message patterns",
@@ -86,6 +89,9 @@
     "logsRetention": "Rotation je Datei bei 10 MiB nach .jsonl.1 (eine Vorgängerdatei; nur für den Eigentümer zugänglich). Ausgehend bedeutet send: vom Filter erlaubt, nicht erfolgreich zugestellt. Die Dateien liegen auf dem Gateway-Server, nicht auf dem Browser-Rechner.",
     "logDirectory": "Log-Verzeichnis",
     "logDirectoryHelp": "Für das ausgewählte Profil. Die Dateinamen kennzeichnen Kanal und Filter; Dateien entstehen beim Aufzeichnen von Entscheidungen.",
+    "contextDirectory": "Verzeichnis für dauerhaften Stufe-1-Kontext",
+    "contextDirectoryHelp": "Der neustartfeste private Zustand wird als passive-context.<Kanal>.json nur für den Eigentümer zugänglich gespeichert. Er enthält zurückgehaltene Nachrichtentexte und wird nach erfolgreicher Übergabe an den Agenten gelöscht.",
+    "attribution": "Die Groupchat-Koordination wurde von RechnerLotsen entwickelt.",
     "patterns": "Nachrichtenmuster",
     "patternHelp": "Ein regulärer Python-Ausdruck pro Zeile. Änderungen ersetzen die Standards. ^...$ prüft die ganze Nachricht. Leere Listen deaktivieren diese Muster, nicht KI-Prüfung oder Lifecycle-Behandlung. Nur vertrauenswürdige Muster verwenden; komplexe Ausdrücke können die Verarbeitung verlangsamen.",
     "inboundPatterns": "Systemmeldungs-Muster",
@@ -171,12 +177,13 @@
     const [decisionLogDirectory, setDecisionLogDirectory] = useState("");
     const [platformChoices, setPlatformChoices] = useState([]);
     const [participation, setParticipation] = useState([]);
+    const [persistentContextDirectory, setPersistentContextDirectory] = useState("");
     useEffect(() => { api.getProfiles().then(result => setProfiles(result.profiles || [])).catch(() => {}); }, []);
     useEffect(() => {
       let cancelled = false;
-      setDraft(null); setSaved(null); setError(""); setMessage(""); setDecisionLogDirectory("");
+      setDraft(null); setSaved(null); setError(""); setMessage(""); setDecisionLogDirectory(""); setPersistentContextDirectory("");
       fetchJSON(endpoint(profile)).then(result => {
-        if (!cancelled) { setDraft(result.settings); setSaved(result.settings); setDefaults(result.defaults); setDecisionLogDirectory(result.decision_log_directory || ""); setPlatformChoices(result.available_platforms || result.settings.platforms); setParticipation(result.groupchat_participation || []); }
+        if (!cancelled) { setDraft(result.settings); setSaved(result.settings); setDefaults(result.defaults); setDecisionLogDirectory(result.decision_log_directory || ""); setPlatformChoices(result.available_platforms || result.settings.platforms); setParticipation(result.groupchat_participation || []); setPersistentContextDirectory(result.persistent_context_directory || ""); }
       }).catch(err => { if (!cancelled) setError(String(err.message || err)); });
       return () => { cancelled = true; };
     }, [profile]);
@@ -285,9 +292,14 @@
           h("p", null, t("logsHelp")),
           h("p", null, t("logDirectory"), h("br"), h("code", { style: { overflowWrap: "anywhere" } }, decisionLogDirectory)),
           h("p", null, t("logDirectoryHelp")),
+          h("p", null, t("contextDirectory"), h("br"), h("code", { style: { overflowWrap: "anywhere" } }, persistentContextDirectory)),
+          h("p", null, t("contextDirectoryHelp")),
           h("p", { className: "gc-note" }, t("logsRetention"))),
         h("footer", { className: "gc-footer" },
-          h("div", { role: "status" }, (message && t(message)) || (changed ? t("unsaved") : t("loaded"))),
+          h("div", null,
+            h("span", { role: "status" }, (message && t(message)) || (changed ? t("unsaved") : t("loaded"))),
+            h("br"),
+            h("a", { href: "https://rechnerlotsen.com/", target: "_blank", rel: "noreferrer" }, t("attribution"))),
           h("button", { type: "button", className: "gc-secondary", disabled: busy || !changed, onClick: () => { setDraft(saved); setMessage(""); } }, t("discard")),
           h("button", { type: "button", className: "gc-primary", disabled: busy || !changed, onClick: save }, busy ? t("saving") : t("save")))));
   }

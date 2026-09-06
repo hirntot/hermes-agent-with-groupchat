@@ -4,6 +4,10 @@ One opt-in Hermes addon for inbound relevance routing and outbound pingpong
 prevention. The filter-model selection is shared by both directions. It does
 not add model tools or change the agent's cached system prompt.
 
+This addon was developed by [RechnerLotsen](https://rechnerlotsen.com/).
+RechnerLotsen builds tools like this for its own background workflows; customer
+computer support remains personal and is provided by real people.
+
 > **Validation scope: Matrix only.** This addon has been live-tested exclusively
 > with Matrix. Telegram, Slack, Mattermost and other selectable transports are
 > architectural integration points that have not yet been validated in live
@@ -98,7 +102,9 @@ Score `0` is discarded. Score `1` has no delivery timer and remains passive
 context until a score `2`–`5` message (or a direct address) starts an agent
 turn. That turn receives the retained context; successful dispatch consumes
 it. Explicit conversations addressed to another local Groupchat profile use
-the same score-1 context lane.
+the same score-1 context lane. This passive context survives gateway restarts:
+it is atomically stored below `HERMES_HOME/groupchat` in
+`passive-context.<channel>.json` and removed only after successful dispatch.
 
 Native transport authorization, allowed-room rules, bot admission and
 mention-only policies are not loosened by this addon. To score unmentioned
@@ -201,6 +207,14 @@ classifications include available provider/model and fallback metadata.
 Message bodies, prompts, credentials, tokens and free-form model rationales are
 deliberately excluded. Logs still contain room/event identifiers and are private
 operational data, not something to publish with an upstream contribution.
+
+The restart-durable score-1 state is deliberately different from the decision
+logs. `HERMES_HOME/groupchat/passive-context.<channel>.json` contains the retained
+message text, sender label, timestamp and available event/reply identifiers because
+that context must be delivered after a restart. The directory uses mode `0700` and
+the state file mode `0600`; writes are atomic. Treat it as private conversation
+data. The dashboard displays the directory for the selected profile, and the file
+is deleted when no retained context remains.
 
 For example, on the gateway server:
 
