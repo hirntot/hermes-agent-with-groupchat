@@ -5,36 +5,14 @@ from typing import Any
 from pathlib import Path
 import yaml
 
-from plugins.groupchat.config import GroupchatSettings, validate_settings, available_platforms
+from plugins.groupchat.config import (
+    GroupchatSettings,
+    available_platforms,
+    matrix_require_mention,
+    validate_settings,
+)
 
 router = APIRouter()
-
-
-def _env_boolean(path: Path, name: str, default: bool) -> bool:
-    try:
-        for raw in path.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            if key.strip() == name:
-                normalized = value.strip().strip("'\"").lower()
-                return normalized not in {"false", "0", "no", "off"}
-    except OSError:
-        pass
-    return default
-
-
-def _matrix_require_mention(profile_home: Path, config: dict[str, Any]) -> bool:
-    matrix = ((config.get("platforms") or {}).get("matrix") or {})
-    configured = matrix.get("require_mention")
-    if configured is None:
-        configured = ((config.get("matrix") or {}).get("require_mention"))
-    if configured is not None:
-        if isinstance(configured, str):
-            return configured.strip().lower() not in {"false", "0", "no", "off"}
-        return bool(configured)
-    return _env_boolean(profile_home / ".env", "MATRIX_REQUIRE_MENTION", True)
 
 
 def groupchat_participation():
@@ -55,7 +33,7 @@ def groupchat_participation():
         plugin_enabled = "groupchat" in (plugins.get("enabled") or []) and "groupchat" not in (plugins.get("disabled") or [])
         relevance_enabled = bool((groupchat.get("relevance") or {}).get("enabled"))
         groupchat_enabled = bool(groupchat.get("enabled") and plugin_enabled and matrix.get("enabled") and "matrix" in (groupchat.get("platforms") or []))
-        require_mention = _matrix_require_mention(home, config)
+        require_mention = matrix_require_mention(home, config)
         result.append({"profile": info.name, "require_mention": require_mention,
                        "groupchat_enabled": groupchat_enabled,
                        "participates": bool(groupchat_enabled and relevance_enabled and not require_mention)})

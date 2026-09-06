@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -318,6 +319,109 @@ async def test_normalized_ingress_without_transport_sdk(platform, tmp_path, monk
     assert adapter.delivered[0].text.startswith("Please review")
     assert "Relevance assessment" in adapter.delivered[0].text
     await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_plain_peer_name_is_dropped_before_scoring_or_buffering(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True},
+        "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().relevance
+    gate._peer_names = ["charlotte", "charlotte ai"]
+    gate._peer_name_pattern = gate._names_pattern(gate._peer_names)
+    gate._throttled_evaluate = AsyncMock(
+        side_effect=AssertionError("peer-targeted message reached scorer")
+    )
+
+    message = event(
+        Platform.MATRIX,
+        text='charlotte, bitte antworte exakt mit "OK"',
+    )
+    message.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(message)
+
+    assert adapter.delivered == []
+    assert gate._pending == {}
+    assert gate._room_transcript["same-room"][-1][1] == message.text
+    record = json.loads(
+        (tmp_path / "logs/matrix-relevance-decisions.jsonl")
+        .read_text()
+        .splitlines()[-1]
+    )
+    assert record["reason_code"] == "plain_name_addressed_to_peer"
+    assert record["explicitly_addressed_elsewhere"] is True
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_plain_own_name_is_an_immediate_direct_address(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True},
+        "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().relevance
+    gate._name_pattern_for_room = lambda _room: gate._names_pattern(["charlotte"])
+    gate._throttled_evaluate = AsyncMock(
+        side_effect=AssertionError("direct name reached scorer")
+    )
+
+    message = event(Platform.MATRIX, text="Charlotte?")
+    message.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(message)
+
+    assert len(adapter.delivered) == 1
+    assert adapter.delivered[0].text.startswith("Charlotte?")
+    assert gate._pending == {}
+    await adapter.disconnect()
+
+
+def test_agent_name_matching_uses_word_boundaries():
+    pattern = IntelligentReactionGate._names_pattern(["lena", "charlotte ai"])
+    assert pattern.search("Lena, bitte übernehmen.")
+    assert pattern.search("charlotte ai?")
+    assert not pattern.search("Elena, bitte übernehmen.")
+    assert not pattern.search("charlotte_airport")
+
+
+def test_peer_names_come_only_from_running_groupchat_participants(
+    tmp_path, monkeypatch
+):
+    peer_home = tmp_path / "profiles" / "charlotte_weiss"
+    peer_home.mkdir(parents=True)
+    peer_home.joinpath("config.yaml").write_text(json.dumps({
+        "plugins": {"enabled": ["groupchat"]},
+        "platforms": {"matrix": {"enabled": True, "require_mention": False}},
+        "groupchat": {
+            "enabled": True,
+            "platforms": ["matrix"],
+            "relevance": {"enabled": True},
+        },
+    }))
+    dormant_home = tmp_path / "profiles" / "dormant_agent"
+    dormant_home.mkdir()
+    dormant_home.joinpath("config.yaml").write_text(peer_home.joinpath("config.yaml").read_text())
+    monkeypatch.setattr(
+        "hermes_cli.profiles.list_profiles",
+        lambda: [
+            SimpleNamespace(
+                name="charlotte_weiss", path=peer_home,
+                gateway_running=True, display_name="Charlotte W.",
+            ),
+            SimpleNamespace(
+                name="dormant_agent", path=dormant_home,
+                gateway_running=False, display_name="",
+            ),
+        ],
+    )
+
+    adapter = Adapter(Platform.MATRIX, {"relevance": {"enabled": True}})
+    names = adapter.conversation_policy().relevance._peer_names
+
+    assert "charlotte" in names
+    assert "charlotte weiss" in names
+    assert "Charlotte W." in names
+    assert "dormant" not in names
 
 
 @pytest.mark.asyncio

@@ -372,6 +372,11 @@ class IntelligentReactionGate:
             setting("MATRIX_INTELLIGENT_REACTION_BURST_THRESHOLD", "10")
         )
         self._relevance_context = self._load_relevance_context()
+        # Resolve local peer identities once at startup. Groupchat setting and
+        # profile changes already require a gateway restart, so per-message
+        # process/config scans would add cost without improving freshness.
+        self._peer_names = self._peer_name_variants()
+        self._peer_name_pattern = self._names_pattern(self._peer_names)
         # ------------------------------------------------------------------
         # Home room for Matrix relevance routing.
         # ------------------------------------------------------------------
@@ -434,6 +439,12 @@ class IntelligentReactionGate:
             contains_matrix_mention = bool(
                 re.search(r"@\S+", msg_event.text or "")
             )
+            addressed_elsewhere = bool(
+                safe_details.get(
+                    "addressed_elsewhere",
+                    contains_matrix_mention and not explicit_mention,
+                )
+            )
             record: Dict[str, Any] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                 "profile": self._profile_dir.name,
@@ -448,9 +459,7 @@ class IntelligentReactionGate:
                 ),
                 "reply_to_event_id": msg_event.reply_to_message_id or None,
                 "explicit_mention": explicit_mention,
-                "explicitly_addressed_elsewhere": (
-                    contains_matrix_mention and not explicit_mention
-                ),
+                "explicitly_addressed_elsewhere": addressed_elsewhere,
                 "room_mode": rc.answer_priority,
                 "relevance_factor": rc.relevance_factor,
                 "decision": decision,
@@ -510,9 +519,9 @@ class IntelligentReactionGate:
     def _evaluation_details(self) -> Dict[str, Any]:
         return dict(self._evaluation_audit.get())
 
-    def _profile_name_variants(self) -> List[str]:
-        """Guess name variants from the profile directory name, e.g. charlotte_weiss."""
-        base = self._profile_dir.name
+    @staticmethod
+    def _name_variants(base: str, display_name: str = "") -> List[str]:
+        """Return conservative spoken-name variants for a Hermes profile."""
         parts = base.replace("-", " ").replace("_", " ").split()
         if not parts:
             return []
@@ -522,7 +531,65 @@ class IntelligentReactionGate:
         if first != last:
             variants.add(f"{first} {last}")
             variants.add(last)
-        return list(variants)
+        if display_name.strip():
+            variants.add(display_name.strip())
+        return sorted(variants, key=lambda value: (-len(value), value.casefold()))
+
+    def _profile_name_variants(self) -> List[str]:
+        """Guess name variants from the profile directory name, e.g. charlotte_weiss."""
+        return self._name_variants(self._profile_dir.name)
+
+    @staticmethod
+    def _names_pattern(names: List[str]) -> re.Pattern:
+        """Match complete names without matching them inside ordinary words."""
+        if not names:
+            return re.compile(r"(?!)")
+        pattern = "|".join(re.escape(name) for name in names)
+        return re.compile(rf"(?<!\w)(?:{pattern})(?!\w)", re.IGNORECASE)
+
+    def _peer_name_variants(self) -> List[str]:
+        """Discover other running local profiles participating in Groupchat.
+
+        Profile IDs are local, non-secret identities. Configuration is checked
+        so dormant profiles and gateways that require explicit Matrix mentions
+        cannot accidentally claim conversational names.
+        """
+        try:
+            import yaml
+            from hermes_cli.profiles import list_profiles
+            from plugins.groupchat.config import matrix_require_mention
+
+            variants: set[str] = set()
+            own_path = self._profile_dir.resolve()
+            for info in list_profiles():
+                home = Path(info.path)
+                if home.resolve() == own_path or not info.gateway_running:
+                    continue
+                try:
+                    config = yaml.safe_load((home / "config.yaml").read_text()) or {}
+                except (OSError, yaml.YAMLError):
+                    continue
+                groupchat = config.get("groupchat") or {}
+                plugins = config.get("plugins") or {}
+                platform_config = (
+                    (config.get("platforms") or {}).get(self._platform) or {}
+                )
+                if not (
+                    groupchat.get("enabled")
+                    and (groupchat.get("relevance") or {}).get("enabled")
+                    and self._platform in (groupchat.get("platforms") or [])
+                    and platform_config.get("enabled")
+                    and "groupchat" in (plugins.get("enabled") or [])
+                    and "groupchat" not in (plugins.get("disabled") or [])
+                ):
+                    continue
+                if self._platform == "matrix" and matrix_require_mention(home, config):
+                    continue
+                variants.update(self._name_variants(info.name, info.display_name))
+            return sorted(variants, key=lambda value: (-len(value), value.casefold()))
+        except Exception as exc:
+            logger.warning("Conversation IR: could not discover peer profile names: %s", exc)
+            return []
 
     def _name_pattern_for_room(self, room: str) -> re.Pattern:
         """Build a regex from the room's stored names AND profile name variants.
@@ -535,10 +602,7 @@ class IntelligentReactionGate:
         room_names = set(rc.names if rc.names else [])
         room_names.update(self._profile_name_variants())
         names = list(room_names)
-        if not names:
-            return re.compile(r"(?!)")
-        pattern = "|".join(re.escape(n) for n in names)
-        return re.compile(pattern, re.IGNORECASE)
+        return self._names_pattern(names)
 
     # ------------------------------------------------------------------ #
     # Self-context
@@ -947,12 +1011,25 @@ class IntelligentReactionGate:
                 event_id=msg_event.message_id,
             )
 
-        if not is_mentioned:
-            if (
-                rc.answer_priority in ("WHEN_MENTIONED", "WHEN_MENTIONED_ONLY")
-                and self._name_pattern_for_room(room).search(text)
-            ):
-                is_mentioned = True
+        # Plain-language agent names are transport-neutral addressing. The
+        # target behaves like it was mentioned; every other local Groupchat
+        # participant drops the request before scoring or buffering. This also
+        # prevents a later peer reply from flushing a non-target's old buffer.
+        own_name_match = bool(self._name_pattern_for_room(room).search(text))
+        peer_name_match = bool(self._peer_name_pattern.search(text))
+        if not is_mentioned and own_name_match:
+            is_mentioned = True
+        elif not is_mentioned and peer_name_match:
+            self._audit(
+                msg_event,
+                phase="decision",
+                decision="drop",
+                reason_code="plain_name_addressed_to_peer",
+                addressed_elsewhere=True,
+                dispatch_attempted=False,
+            )
+            _commit_to_transcript()
+            return
 
         if is_mentioned:
             # Direct mention: flush everything for this room, including the mention.
