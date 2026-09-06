@@ -51,8 +51,12 @@ added together. An empty list disables this check. The former `interrupt_notice`
 setting is converted to a one-item list when settings are loaded; saving writes
 only `literal_phrases`. Separate system-message regex/lifecycle rules retain their
 own behavior and are not exempted by this literal-list mention exception.
-Pingpong regexes search case-insensitively in raw and Markdown-stripped replies,
+Pingpong regexes search case-insensitively in raw and Markdown-stripped replies
 before the length threshold and model check. Anchors `^...$` match whole replies.
+A short pattern-matched reply is allowed when the immediately preceding English or German
+message explicitly requests visible output (for example, “reply exactly with
+ok” or “antworte exakt mit ok”). Negated requests such as “do not reply” and
+“nicht antworten” do not trigger this exception.
 
 Empty lists do not disable AI checks, empty-output suppression, duplicate/voice
 coordination, or structural edit/delete lifecycle handling. These editors accept

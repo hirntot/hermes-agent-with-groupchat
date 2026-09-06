@@ -63,6 +63,31 @@ def test_bilingual_guard_defaults(reply):
     assert decision["pattern_index"] > 0
 
 
+@pytest.mark.parametrize("context", [
+    "Please reply exactly with ok.",
+    "Please say ok.",
+    "Bitte antworte exakt mit ok.",
+    "Sag bitte ok.",
+])
+def test_requested_pattern_reply_is_sent(context):
+    from plugins.groupchat.pingpong_guard import decide
+    decision = decide("ok", context, {}, 60)
+    assert decision["decision"] == "send"
+    assert decision["reason_code"] == "explicit_response_request"
+
+
+@pytest.mark.parametrize("context", [
+    "Charlotte is working on this.",
+    "Please do not reply.",
+    "Bitte nicht antworten.",
+])
+def test_unrequested_or_negated_pattern_reply_is_suppressed(context):
+    from plugins.groupchat.pingpong_guard import decide
+    decision = decide("ok", context, {}, 60)
+    assert decision["decision"] == "suppress"
+    assert decision["reason_code"] == "pattern_match"
+
+
 @pytest.mark.asyncio
 async def test_outbound_decision_log_is_private_and_explains_rule(tmp_path):
     import stat

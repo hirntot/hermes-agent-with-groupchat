@@ -53,6 +53,34 @@ SILENCE_PATTERNS = [
 ]
 
 
+_EXPLICIT_RESPONSE_REQUESTS = (
+    r"\b(?:reply|respond|answer|say|write|send|return|repeat|confirm|acknowledge)\b",
+    r"\b(?:antworte|antworten|schreib(?:e)?|sag(?:e)?|wiederhol(?:e)?|bestätig(?:e|en)?)\b",
+    r"\bgib\b.{0,32}\baus\b",
+)
+_NEGATED_RESPONSE_REQUESTS = (
+    r"\b(?:do\s+not|don't|dont|never|no\s+need\s+to)\s+(?:reply|respond|answer|say|write|send|return|repeat|confirm|acknowledge)\b",
+    r"\b(?:nicht|nie)\s+(?:antworten|schreiben|sagen|wiederholen|bestätigen)\b",
+)
+
+
+def explicitly_requests_response(context):
+    """Recognize a direct English/German request for visible output.
+
+    This exception is deliberately narrow. It only protects a requested short
+    response from the deterministic acknowledgement patterns; ordinary short
+    replies still reach the normal pingpong suppression path.
+    """
+    normalized = strip_markdown(context or "").strip()
+    if not normalized:
+        return False
+    if any(re.search(pattern, normalized, re.IGNORECASE)
+           for pattern in _NEGATED_RESPONSE_REQUESTS):
+        return False
+    return any(re.search(pattern, normalized, re.IGNORECASE)
+               for pattern in _EXPLICIT_RESPONSE_REQUESTS)
+
+
 def obvious_pingpong(text, patterns=None):
     raw = text.strip()
     clean = strip_markdown(raw).strip()
@@ -78,6 +106,9 @@ def decide(text, context, filter_model, min_chars=60, patterns=None):
         if not pattern.strip() or pattern.lstrip().startswith('#'):
             continue
         if any(re.search(pattern, value, re.IGNORECASE) for value in (text, strip_markdown(text).strip())):
+            if explicitly_requests_response(context):
+                return {"decision": "send", "reason_code": "explicit_response_request",
+                        "pattern_index": index, "pattern_sha256": hashlib.sha256(pattern.encode()).hexdigest()}
             return {"decision": "suppress", "reason_code": "pattern_match",
                     "pattern_index": index, "pattern_sha256": hashlib.sha256(pattern.encode()).hexdigest()}
     if len(strip_markdown(text).strip()) >= min_chars:
