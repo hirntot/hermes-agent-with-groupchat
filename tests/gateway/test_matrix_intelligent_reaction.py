@@ -322,6 +322,11 @@ def test_interrupt_notice_is_dropped_only_when_it_is_the_majority(
             "[felix_ai] felix_ai: ⚠️ **Dangerous command requires approval**\n"
             "```\nrm /tmp/example\n```"
         ),
+        (
+            "[bastian_ai] ⚠️ **Confirm /new**\n"
+            "This starts a fresh session and discards the current conversation history.\n"
+            "Choose: Approve Once, Always Approve, or Cancel."
+        ),
         "[lena_ai] That reaction is not valid for this approval prompt.",
     ],
 )
