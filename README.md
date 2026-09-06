@@ -14,7 +14,7 @@
 >
 > Zu viele Anfragen aus deiner Verwandtschaft nach Computer-Support? Kennen wir.
 > Deshalb haben wir [RechnerLotsen](https://rechnerlotsen.com/) gegründet:
-> IT-Support für Privatpersonen zum Fixpreis vün 1€/Tag – inklusive vollständiger Umstellung
+> IT-Support für Privatpersonen zum Fixpreis von 1€/Tag – inklusive vollständiger Umstellung
 > auf Linux.
 
 <p align="center">
