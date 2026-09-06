@@ -4,6 +4,11 @@ One opt-in Hermes addon for inbound relevance routing and outbound pingpong
 prevention. The filter-model selection is shared by both directions. It does
 not add model tools or change the agent's cached system prompt.
 
+> **Validation scope: Matrix only.** This addon has been live-tested exclusively
+> with Matrix. Telegram, Slack, Mattermost and other selectable transports are
+> architectural integration points that have not yet been validated in live
+> group chats; they are not currently claimed as supported Groupchat transports.
+
 ## Configuration
 
 Enable `groupchat` through Hermes's existing plugin manager. In the dashboard,

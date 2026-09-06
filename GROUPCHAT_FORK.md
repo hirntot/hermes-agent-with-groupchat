@@ -20,11 +20,12 @@ lists allow administrators to inspect and adapt deterministic decisions.
 - Fork base: Hermes Agent 0.21.0, upstream commit
   `63279301bcbdc185c1b07b98a9312eb0c862f26d`
 - Addon version: `0.1.0-experimental`
-- Live-tested transport: Matrix
+- Live-tested transport: **Matrix only**
 - Integration tests: 118 focused Groupchat, conversation-policy and delivery
   ledger tests, plus the adjacent Matrix test suites used during development
 - Telegram, Slack and Mattermost use the normalized middleware boundary but
-  have not yet received equivalent production live testing
+  have not been validated in live group chats. Their presence in configuration
+  and code must not be read as a support or compatibility claim.
 
 This publication is a reproducible snapshot of the deployed downstream build,
 not yet a minimal upstream pull request. It contains supporting gateway and

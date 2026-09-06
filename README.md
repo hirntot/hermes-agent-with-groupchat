@@ -9,6 +9,10 @@
 > community-maintained fork and not an official Nous Research release. Start with
 > [GROUPCHAT_FORK.md](GROUPCHAT_FORK.md) and the
 > [Groupchat addon documentation](plugins/groupchat/README.md).
+>
+> **Validation scope: Matrix only.** Groupchat has been live-tested exclusively
+> with Matrix. Other transports exposed by the transport-independent interface
+> have not yet been validated in live group chats.
 
 > ### A small note from RechnerLotsen (german-only!)
 >
