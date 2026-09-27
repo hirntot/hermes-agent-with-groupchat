@@ -64,7 +64,7 @@ except ImportError:
         "ROOM_MESSAGE": "m.room.message", "REACTION": "m.reaction",
         "TYPING": "m.typing",
         "find": staticmethod(lambda value: value),
-        "ROOM_ENCRYPTED": "m.room.encrypted", "ROOM_NAME": "m.room.name"})
+        "ROOM_ENCRYPTED": "m.room.encrypted", "ROOM_NAME": "m.room.name", "ROOM_REDACTION": "m.room.redaction"})
     PresenceState = type("_PresenceStateStub", (), {  # type: ignore[misc,assignment]
         "ONLINE": "online", "OFFLINE": "offline", "UNAVAILABLE": "unavailable"})
     RoomCreatePreset = type("_RoomCreatePresetStub", (), {  # type: ignore[misc,assignment]
@@ -73,6 +73,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from plugins.platforms.matrix.relations import MatrixRelation
+from plugins.platforms.matrix.reply_context import MatrixEventContext, MatrixEventContextCache
 from gateway.platforms.base_exec_approval import EA_HEADER_TEXT
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
@@ -890,6 +891,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._room_identity_cached_at: Dict[str, float] = {}
         self._room_identity_ttl_seconds = _env_number("MATRIX_ROOM_IDENTITY_TTL_SECONDS", 60.0, float)
         self._room_identity_cache_max = 256
+        self._event_context_cache = MatrixEventContextCache()
         self._joined_rooms: Set[str] = set()
         from collections import deque
         self._processed_events: deque = deque(maxlen=1000)  # event dedup, newest kept
@@ -1411,6 +1413,9 @@ class MatrixAdapter(BasePlatformAdapter):
         client.add_event_handler(EventType.REACTION, self._on_reaction, wait_sync=True)
         client.add_event_handler(getattr(EventType, "TYPING", "m.typing"), self._on_typing, wait_sync=True)
         client.add_event_handler(IntEvt.INVITE, self._on_invite, wait_sync=True)
+        redaction_type = getattr(EventType, "ROOM_REDACTION", None)
+        if redaction_type is not None:
+            client.add_event_handler(redaction_type, self._on_redaction, wait_sync=True)
         self._startup_ts = time.time()
         self._reset_clock_skew_detector()  # a reconnect after an NTP fix starts clean
         self._closing = False
@@ -2109,6 +2114,7 @@ class MatrixAdapter(BasePlatformAdapter):
             msgtype = str(content.msgtype) if hasattr(content, "msgtype") else ""
         relates_to = source_content.get("m.relates_to", {})
         if MatrixRelation.from_content(relates_to).is_edit:
+            self._event_context_cache.apply_edit(room_id, sender, source_content)
             return
         # m.notice is the conventional bot-response msgtype; ignoring it prevents bot-to-bot loops.
         if msgtype == "m.notice" and not self._process_notices:
@@ -2195,20 +2201,38 @@ class MatrixAdapter(BasePlatformAdapter):
         return body, is_dm, chat_type, thread_id, display_name, source
 
     async def _extract_reply_context(
-        self, room_id: str, body: str, relates_to: dict
-    ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+        self, room_id: str, body: str, relates_to: dict, *, sender: str, chat_type: str
+    ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str], bool, Optional[bool]]:
         """Return (body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name). Captures
         the inline reply fallback (``> <@user:srv> text\\n\\nreply``) BEFORE stripping it, so the
         prompt layer can render "[Replying to: ...]" like Signal/Slack/Telegram."""
         reply_to = MatrixRelation.from_content(relates_to).reply_target
         reply_to_text = reply_to_author_id = reply_to_author_name = None
+        reply_to_is_own_message = False
+        reply_to_author_authorized = None
         if reply_to and body.startswith("> "):
             reply_to_text, reply_to_author_id = _extract_reply_fallback(body)
             body = _strip_reply_fallback(body)
             # Resolve the replied-to author's display name (falls back to localpart).
             if reply_to_author_id:
                 reply_to_author_name = await self._get_display_name(room_id, reply_to_author_id)
-        return body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name
+                reply_to_is_own_message = reply_to_author_id == self._user_id
+        if reply_to and not reply_to_text and self._is_sender_authorized(
+            sender, chat_type=chat_type, chat_id=room_id
+        ) is not False:
+            parent = await self._event_context_cache.resolve(self._client, room_id, reply_to)
+            if parent is not None:
+                reply_to_text = parent.text
+                reply_to_author_id = parent.sender or None
+                if reply_to_author_id:
+                    reply_to_author_name = await self._get_display_name(room_id, reply_to_author_id)
+                    reply_to_is_own_message = reply_to_author_id == self._user_id
+                    if not reply_to_is_own_message:
+                        reply_to_author_authorized = self._is_sender_authorized(
+                            reply_to_author_id, chat_type=chat_type, chat_id=room_id
+                        )
+        return (body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name,
+                reply_to_is_own_message, reply_to_author_authorized)
 
     async def _build_inbound_event(
         self, room_id: str, sender: str, event_id: str, body: str, source_content: dict, relates_to: dict,
@@ -2221,14 +2245,15 @@ class MatrixAdapter(BasePlatformAdapter):
             ctx = await self._resolve_message_context(room_id, sender, event_id, body, source_content, relates_to)
         if ctx is None:
             return None
-        body, _is_dm, _chat_type, _thread_id, display_name, source = ctx
+        body, _is_dm, chat_type, _thread_id, display_name, source = ctx
         mentions_block = source_content.get("m.mentions") or {}
         mention_user_ids = mentions_block.get("user_ids") if isinstance(mentions_block, dict) else None
         is_mentioned = self._is_bot_mentioned(
             source_content.get("body", body), source_content.get("formatted_body"), mention_user_ids
         )
-        body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name = (
-            await self._extract_reply_context(room_id, body, relates_to))
+        (body, reply_to, reply_to_text, reply_to_author_id, reply_to_author_name,
+         reply_to_is_own_message, reply_to_author_authorized) = await self._extract_reply_context(
+            room_id, body, relates_to, sender=sender, chat_type=chat_type)
         media_msgtype = extra.pop("media_msgtype", None)
         if media_msgtype is None:
             # Re-normalize after reply stripping so ``> quoted\n\n!model`` is still a command.
@@ -2242,6 +2267,8 @@ class MatrixAdapter(BasePlatformAdapter):
             text=body, source=source, raw_message=source_content, message_id=event_id,
             reply_to_message_id=reply_to, reply_to_text=reply_to_text, reply_to_author_id=reply_to_author_id,
             reply_to_author_name=reply_to_author_name,
+            reply_to_is_own_message=reply_to_is_own_message,
+            reply_to_author_authorized=reply_to_author_authorized,
             # Top-level sender fields mirror source.* — downstream prompt code reads them.
             user_id=sender, user_name=display_name, metadata=metadata, **extra)
 
@@ -2269,6 +2296,7 @@ class MatrixAdapter(BasePlatformAdapter):
             room_id, sender, event_id, _normalize_matrix_bang_command(body), source_content, relates_to)
         if msg_event is None:
             return
+        self._event_context_cache.store(room_id, event_id, MatrixEventContext(sender, msg_event.text))
         if self.conversation_middleware().delays_messages:
             await self.handle_message(msg_event)
         elif msg_event.message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
@@ -2385,6 +2413,15 @@ class MatrixAdapter(BasePlatformAdapter):
             return await cache_audio_from_bytes_async(file_bytes, ext=ext)
         filename = body or ("video.mp4" if msg_type == MessageType.VIDEO else "document")
         return await cache_document_from_bytes_async(file_bytes, filename)
+
+    async def _on_redaction(self, event: Any) -> None:
+        room_id = str(getattr(event, "room_id", "") or "")
+        target = str(getattr(event, "redacts", "") or "")
+        if not target:
+            content = getattr(event, "content", None)
+            target = str(content.get("redacts") or "") if isinstance(content, dict) else ""
+        if room_id and target:
+            self._event_context_cache.redact(room_id, target)
 
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""
