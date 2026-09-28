@@ -503,7 +503,7 @@ async def test_passive_context_survives_restart_and_is_consumed_after_dispatch(
     context_event.metadata["conversation_mentioned"] = False
     await first.handle_message(context_event)
 
-    state_file = tmp_path / "groupchat" / "passive-context.matrix.json"
+    state_file = tmp_path / "groupchat" / "passive-context.matrix.main.json"
     assert state_file.exists()
     assert state_file.stat().st_mode & 0o777 == 0o600
     assert state_file.parent.stat().st_mode & 0o777 == 0o700
@@ -775,7 +775,7 @@ async def test_scopes_isolate_threads_workspaces_and_platforms(monkeypatch, tmp_
     assert not other_workspace.last_inbound
     assert first.relevance._context_file != other_thread.relevance._context_file
     assert first.relevance._context_file != other_workspace.relevance._context_file
-    assert first.relevance._room_transcript is other_thread.relevance._room_transcript
+    assert first.relevance._room_transcript is not other_thread.relevance._room_transcript
     assert first.relevance._room_transcript is not other_workspace.relevance._room_transcript
     assert root.for_conversation("same-room", {"slack_team_id": "team-a", "thread_id": "1"}) is first
     telegram = Adapter(Platform.TELEGRAM, {"relevance": {"enabled": True}})
@@ -785,46 +785,34 @@ async def test_scopes_isolate_threads_workspaces_and_platforms(monkeypatch, tmp_
 
 
 @pytest.mark.anyio
-async def test_thread_lanes_share_clean_room_context_without_merging_queues(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    adapter = Adapter(Platform.MATRIX, {"relevance": {"enabled": True}})
-    root = adapter.conversation_policy()
-    first = root.for_conversation("same-room", {}, "thread-1")
-    second = root.for_conversation("same-room", {}, "thread-2")
-
-    assert first.relevance._room_transcript is second.relevance._room_transcript
-    assert first.relevance._passive_context is second.relevance._passive_context
-    assert (
-        first.relevance._peer_targeted_event_ids
-        is second.relevance._peer_targeted_event_ids
-    )
-    assert first.relevance._pending is not second.relevance._pending
-
-    first.relevance._record_transcript(
-        "same-room",
-        sender="Moritz",
-        text="Charlotte, please inspect your installed skills.",
-        timestamp=1.0,
-        event_id="earlier",
-    )
-    second.relevance._throttled_evaluate = AsyncMock(
-        return_value=(5, "Elliptical follow-up for this agent.")
-    )
-    follow_up = event(
-        Platform.MATRIX,
-        thread="thread-2",
-        text="Bastian, you too.",
-    )
-    follow_up.metadata["conversation_mentioned"] = False
-    await adapter.handle_message(follow_up)
-
-    assert len(adapter.delivered) == 1
-    assert "Charlotte, please inspect your installed skills." in (
-        adapter.delivered[0].channel_context or ""
-    )
-    assert adapter.delivered[0].source.thread_id == "thread-2"
+@pytest.mark.parametrize("restart", [False, True])
+async def test_thread_and_main_context_stay_separate(tmp_path, restart):
+    settings = {"relevance": {"enabled": True}, "pingpong_guard": {"enabled": False}}
+    adapter = Adapter(Platform.MATRIX, settings)
+    roots = [None, "thread-a", "thread-b"]
+    markers = ["MAIN-ONLY", "FIRST-ONLY", "SECOND-ONLY"]
+    for thread, marker in zip(roots, markers):
+        gate = adapter.conversation_policy().for_conversation("same-room", {}, thread).relevance
+        gate._throttled_evaluate = AsyncMock(return_value=(1, "Retain context."))
+        message = event(Platform.MATRIX, thread=thread, text=marker)
+        message.message_id = marker
+        message.metadata["conversation_mentioned"] = False
+        await adapter.handle_message(message)
+    if restart:
+        await adapter.disconnect()
+        adapter = Adapter(Platform.MATRIX, settings)
+    for thread, marker in zip(roots, markers):
+        gate = adapter.conversation_policy().for_conversation("same-room", {}, thread).relevance
+        gate._throttled_evaluate = AsyncMock(return_value=(5, "Respond now."))
+        trigger = event(Platform.MATRIX, thread=thread, text="Please continue.")
+        trigger.message_id = "trigger-" + marker
+        trigger.metadata["conversation_mentioned"] = False
+        await adapter.handle_message(trigger)
+        delivered = adapter.delivered[-1]
+        context = delivered.channel_context or ""
+        assert marker in context
+        assert all(other not in context for other in markers if other != marker)
+        assert delivered.source.thread_id == thread
     await adapter.disconnect()
 
 

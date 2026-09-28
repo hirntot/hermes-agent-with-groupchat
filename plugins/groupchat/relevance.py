@@ -229,7 +229,7 @@ class IntelligentReactionGate:
     def __init__(self, adapter: Any, config: Any, *, settings=None,
                  platform="matrix", dispatch=None, own_user_id=None,
                  room_transcript=None, passive_context=None,
-                 peer_targeted_event_ids=None):
+                 peer_targeted_event_ids=None, context_scope=None):
         self._tasks = set()
         self._closed = False
         self._adapter = adapter
@@ -319,8 +319,11 @@ class IntelligentReactionGate:
         self._pending: Dict[str, _PendingBuffer] = {}
         # Score-1 events have no timer. They remain passive context until an
         # independently relevant event is dispatched to the agent.
+        # Legacy files combined thread and room context; keep them on disk but
+        # never import that ambiguous backlog into a strictly scoped conversation.
+        scope_suffix = f".{context_scope}" if context_scope else ""
         self._passive_context_file = (
-            self._profile_dir / "groupchat" / f"passive-context.{platform}.json"
+            self._profile_dir / "groupchat" / f"passive-context.{platform}{scope_suffix}.json"
         )
         self._passive_context: Dict[str, List[_PassiveContextEntry]] = (
             passive_context if passive_context is not None else {}
