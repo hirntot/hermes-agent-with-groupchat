@@ -7,6 +7,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageEvent
 from plugins.platforms.matrix.adapter import MatrixAdapter
+from plugins.platforms.matrix.reply_context import MatrixEventContext
 from plugins.platforms.matrix import thread_choice
 
 
@@ -97,3 +98,26 @@ async def test_classifier_receives_only_current_message(monkeypatch):
         "Please implement this\n\n[Relevance assessment: private room history]", {})
     assert "private room history" not in captured["prompt"]
     assert "Please implement this" in captured["prompt"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parent_sender,is_own", [
+    ("@agent:example.test", True), ("@peer:example.test", False),
+])
+async def test_quoted_group_reply_uses_authenticated_parent_sender(parent_sender, is_own):
+    adapter = MatrixAdapter(PlatformConfig(extra={"user_id": "@agent:example.test"}))
+    adapter._is_sender_authorized = lambda *args, **kwargs: True
+    adapter._get_display_name = AsyncMock(return_value="Agent")
+    adapter._event_context_cache.resolve = AsyncMock(
+        return_value=MatrixEventContext(parent_sender, "Earlier message"))
+    relation = {"rel_type": "m.thread", "event_id": "$root",
+                "m.in_reply_to": {"event_id": "$root"}}
+
+    reply = await adapter._extract_reply_context(
+        "!lab:example.test", "> <@agent:example.test> Earlier message\n\nPlease proceed",
+        relation, sender="@human:example.test", chat_type="group",
+    )
+
+    adapter._event_context_cache.resolve.assert_awaited_once()
+    assert reply.is_own_message is is_own
+    assert reply.author_id == parent_sender

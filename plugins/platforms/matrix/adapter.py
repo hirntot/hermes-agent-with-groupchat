@@ -2247,8 +2247,12 @@ class MatrixAdapter(BasePlatformAdapter):
             reply_to_text = extract_mx_reply_quote(formatted_body)
             if reply_to_text:
                 reply_to_author_authorized = False
+        # A quoted fallback is user-controlled text. In groups we still need the
+        # authenticated parent sender to know whether this is a reply to our bot,
+        # including after a restart when the in-memory own-message set is empty.
         if reply_to and (
-            not reply_to_text or _is_bare_media_filename("m.image", reply_to_text)
+            chat_type == "group" or not reply_to_text
+            or _is_bare_media_filename("m.image", reply_to_text)
         ) and self._is_sender_authorized(
             sender, chat_type=chat_type, chat_id=room_id
         ) is not False:
