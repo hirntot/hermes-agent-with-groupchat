@@ -397,6 +397,83 @@ async def test_plain_peer_name_is_dropped_before_scoring_or_buffering(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_names_inside_an_instruction_do_not_address_peer(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().relevance
+    gate._peer_name_pattern = gate._names_pattern(["marlene", "hannes"])
+    gate._throttled_evaluate = AsyncMock(return_value=(5, "A request to this agent."))
+    message = event(Platform.MATRIX, text=(
+        "Ja, bitte erstelle diesen Raum, bzw. beauftrage Marlene im Admin-Chat. "
+        "Hannes ist der Falsche, das musst du selber machen."
+    ))
+    message.metadata["conversation_mentioned"] = False
+
+    await adapter.handle_message(message)
+
+    assert len(adapter.delivered) == 1
+    assert adapter.delivered[0].text.startswith(message.text)
+    assert message.message_id not in gate._peer_targeted_event_ids.get("same-room", set())
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
+async def test_reply_to_own_message_beats_incidental_peer_names(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().relevance
+    gate._peer_name_pattern = gate._names_pattern(["marlene", "hannes"])
+    gate._throttled_evaluate = AsyncMock(
+        side_effect=AssertionError("own reply reached relevance scorer")
+    )
+    message = event(Platform.MATRIX, text=(
+        "Ja, bitte erstelle diesen Raum, bzw. beauftrage Marlene im Admin-Chat. "
+        "Hannes ist der Falsche."
+    ))
+    message.reply_to_message_id = "$own"
+    message.reply_to_is_own_message = True
+    message.metadata["conversation_mentioned"] = False
+
+    await adapter.handle_message(message)
+
+    assert len(adapter.delivered) == 1
+    assert adapter.delivered[0].text.startswith(message.text)
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
+async def test_direct_followup_reactivates_passive_request_in_same_thread(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    policy = adapter.conversation_policy().for_conversation("same-room", thread_id="$root")
+    gate = policy.relevance
+    gate._peer_name_pattern = gate._names_pattern(["charlotte"])
+    original = event(Platform.MATRIX, thread="$root", text="Charlotte, please make a plan")
+    original.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(original)
+    assert adapter.delivered == []
+
+    followup = event(Platform.MATRIX, thread="$root", text="Lena?")
+    followup.message_id = "$followup"
+    # Element's m.thread fallback carries the concrete parent outside the
+    # ordinary reply_to_message_id field.
+    followup.metadata["conversation_reply_anchor_id"] = original.message_id
+    followup.metadata["conversation_mentioned"] = True
+    await adapter.handle_message(followup)
+
+    assert len(adapter.delivered) == 1
+    delivered = adapter.delivered[0]
+    assert "Charlotte, please make a plan" in delivered.text
+    assert "Lena?" in delivered.text
+    assert "do not answer them retroactively" not in (delivered.channel_context or "")
+    assert not gate._passive_context.get("same-room")
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
 async def test_peer_thread_stays_passive_until_next_open_message(tmp_path):
     adapter = Adapter(Platform.MATRIX, {
         "relevance": {"enabled": True},

@@ -655,6 +655,19 @@ class IntelligentReactionGate:
         names = list(room_names)
         return self._names_pattern(names)
 
+    def _is_peer_addressed_by_name(self, text: str) -> bool:
+        """Only a leading vocative addresses a peer; a name in a task is context."""
+        lead = re.sub(r"^(?:hallo|hi|hey)\s+", "", text.lstrip(), flags=re.IGNORECASE)
+        match = self._peer_name_pattern.search(lead)
+        if match is None or lead[:match.start()] not in {"", "@"}:
+            return False
+        tail = lead[match.end():]
+        return bool(
+            lead.startswith("@")
+            or re.match(r"^\s*[,;:!?]", tail)
+            or re.match(r"^\s+(?:bitte|please|kannst|could|can)\b", tail, re.IGNORECASE)
+        )
+
     # ------------------------------------------------------------------ #
     # Self-context
     # ------------------------------------------------------------------ #
@@ -1104,11 +1117,16 @@ class IntelligentReactionGate:
         # target behaves like it was mentioned; every other local Groupchat
         # participant keeps the complete reply chain as passive score-1 context.
         own_name_match = bool(self._name_pattern_for_room(room).search(text))
-        peer_name_match = bool(self._peer_name_pattern.search(text))
+        peer_name_match = self._is_peer_addressed_by_name(text)
+        reply_anchor = (msg_event.reply_to_message_id
+                        or (msg_event.metadata or {}).get("conversation_reply_anchor_id"))
+        own_reply = bool(
+            reply_anchor and reply_anchor in self._own_message_ids.get(room, set())
+        )
+        if own_reply:
+            is_mentioned = True
         inherited_peer_target = bool(
-            msg_event.reply_to_message_id
-            and msg_event.reply_to_message_id
-            in self._peer_targeted_event_ids.get(room, set())
+            reply_anchor and reply_anchor in self._peer_targeted_event_ids.get(room, set())
         )
         if not is_mentioned and own_name_match:
             is_mentioned = True
@@ -1155,6 +1173,18 @@ class IntelligentReactionGate:
             # Direct mention: flush everything for this room, including the mention.
             if msg_event.message_id:
                 self._mentioned_event_ids.setdefault(room, set()).add(msg_event.message_id)
+            # A user can assign a previously passive message to this agent by
+            # replying to that exact event. Treat it as the current request,
+            # not as historic context with a "do not answer" instruction.
+            promoted = next((entry for entry in self._passive_context.get(room, [])
+                             if entry.event_id == reply_anchor
+                             and entry.sender == sender), None)
+            if promoted is not None:
+                msg_event = dataclasses.replace(
+                    msg_event,
+                    text=("[Earlier message now explicitly assigned to you]\n"
+                          f"{promoted.text}\n\n[Current follow-up]\n{msg_event.text}"),
+                )
             logger.debug("Conversation IR: room %s direct mention/name match, flushing", room)
             self._audit(
                 msg_event,
@@ -1163,7 +1193,10 @@ class IntelligentReactionGate:
                 reason_code="direct_mention_or_name",
                 explicit_mention=True,
             )
-            await self._flush(room, with_event=msg_event, rationale="Directly mentioned.")
+            await self._flush(
+                room, with_event=msg_event, rationale="Directly mentioned.",
+                promoted_event_id=promoted.event_id if promoted else None,
+            )
             _commit_to_transcript()
             return
 
@@ -1210,13 +1243,13 @@ class IntelligentReactionGate:
         def _is_thread_continuation() -> bool:
             """Return True if this message replies to one where we were addressed
             or to one we sent ourselves."""
-            if not msg_event.reply_to_message_id:
+            if not reply_anchor:
                 return False
-            mentioned = msg_event.reply_to_message_id in self._mentioned_event_ids.get(room, set())
-            own = msg_event.reply_to_message_id in self._own_message_ids.get(room, set())
+            mentioned = reply_anchor in self._mentioned_event_ids.get(room, set())
+            own = reply_anchor in self._own_message_ids.get(room, set())
             logger.debug(
                 "Conversation IR: reply_to=%s mentioned=%s own=%s",
-                msg_event.reply_to_message_id, mentioned, own,
+                reply_anchor, mentioned, own,
             )
             return mentioned or own
 
@@ -1468,6 +1501,7 @@ class IntelligentReactionGate:
         room: str,
         with_event: Optional[MessageEvent] = None,
         rationale: str = "",
+        promoted_event_id: Optional[str] = None,
     ) -> None:
         buf = self._pending.pop(room, None)
         if buf is None:
@@ -1502,7 +1536,8 @@ class IntelligentReactionGate:
         else:
             new_text = combined_text[:12000] + " ..." + note
 
-        passive_context = self._passive_context_for_agent(room)
+        passive_context = self._passive_context_for_agent(
+            room, exclude_event_id=promoted_event_id)
         channel_context = (last_event.channel_context or "").strip()
         if passive_context:
             channel_context = "\n\n".join(
@@ -1605,8 +1640,9 @@ class IntelligentReactionGate:
         )
         self._persist_passive_context()
 
-    def _passive_context_for_agent(self, room: str) -> str:
-        events = self._passive_context.get(room, [])
+    def _passive_context_for_agent(self, room: str, *, exclude_event_id: str | None = None) -> str:
+        events = [entry for entry in self._passive_context.get(room, [])
+                  if entry.event_id != exclude_event_id]
         if not events:
             return ""
         lines = [

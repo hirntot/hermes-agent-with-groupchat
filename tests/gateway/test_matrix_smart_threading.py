@@ -7,6 +7,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageEvent
 from plugins.platforms.matrix.adapter import MatrixAdapter
+from plugins.platforms.matrix.reply_context import MatrixEventContext
 from plugins.platforms.matrix import thread_choice
 
 
@@ -97,3 +98,51 @@ async def test_classifier_receives_only_current_message(monkeypatch):
         "Please implement this\n\n[Relevance assessment: private room history]", {})
     assert "private room history" not in captured["prompt"]
     assert "Please implement this" in captured["prompt"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parent_sender,is_own", [
+    ("@agent:example.test", True), ("@peer:example.test", False),
+])
+async def test_quoted_group_reply_uses_authenticated_parent_sender(parent_sender, is_own):
+    adapter = MatrixAdapter(PlatformConfig(extra={"user_id": "@agent:example.test"}))
+    adapter._is_sender_authorized = lambda *args, **kwargs: True
+    adapter._get_display_name = AsyncMock(return_value="Agent")
+    adapter._event_context_cache.resolve = AsyncMock(
+        return_value=MatrixEventContext(parent_sender, "Earlier message"))
+    relation = {"rel_type": "m.thread", "event_id": "$root",
+                "m.in_reply_to": {"event_id": "$root"}}
+
+    reply = await adapter._extract_reply_context(
+        "!lab:example.test", "> <@agent:example.test> Earlier message\n\nPlease proceed",
+        relation, sender="@human:example.test", chat_type="group",
+    )
+
+    adapter._event_context_cache.resolve.assert_awaited_once()
+    assert reply.is_own_message is is_own
+    assert reply.author_id == parent_sender
+
+
+@pytest.mark.anyio
+async def test_thread_fallback_exposes_parent_for_groupchat_without_becoming_a_quote():
+    adapter = MatrixAdapter(PlatformConfig(extra={"user_id": "@agent:example.test"}))
+    source = adapter.build_source(
+        chat_id="!lab:example.test", chat_type="group",
+        user_id="@human:example.test", thread_id="$root", message_id="$child",
+    )
+    adapter._is_sender_authorized = lambda *args, **kwargs: True
+    adapter._is_bot_mentioned = MagicMock(return_value=False)
+    adapter._event_context_cache.resolve = AsyncMock(
+        return_value=MatrixEventContext("@agent:example.test", "Earlier bot message"))
+    relates_to = {"rel_type": "m.thread", "event_id": "$root", "is_falling_back": True,
+                  "m.in_reply_to": {"event_id": "$parent"}}
+
+    event = await adapter._build_inbound_event(
+        "!lab:example.test", "@human:example.test", "$child", "Please proceed",
+        {"msgtype": "m.text", "body": "Please proceed"}, relates_to,
+        ctx=("Please proceed", False, "group", "$root", "Human", source),
+    )
+
+    assert event.reply_to_message_id is None
+    assert event.metadata["conversation_reply_anchor_id"] == "$parent"
+    assert event.reply_to_is_own_message is True
