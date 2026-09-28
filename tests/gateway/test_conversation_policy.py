@@ -565,6 +565,34 @@ async def test_only_addressed_root_keeps_thread_active_without_new_mention(
 
 
 @pytest.mark.anyio
+async def test_addressed_matrix_root_remains_active_after_gateway_restart(tmp_path):
+    settings = {"relevance": {"enabled": True},
+                "pingpong_guard": {"enabled": False}}
+    first = Adapter(Platform.MATRIX, settings)
+    root = event(Platform.MATRIX, text="Lena, please work on this")
+    root.message_id = "$restart-root"
+    root.metadata["conversation_mentioned"] = True
+    await first.handle_message(root)
+    roots_file = tmp_path / "groupchat/matrix-active-thread-roots.json"
+    assert roots_file.exists()
+    await first.disconnect()
+
+    second = Adapter(Platform.MATRIX, settings)
+    gate = second.conversation_policy().for_conversation(
+        "same-room", thread_id="$restart-root").relevance
+    gate._throttled_evaluate = AsyncMock(return_value=(5, "Relevant follow-up."))
+    followup = event(Platform.MATRIX, thread="$restart-root",
+                     text="There is another detail")
+    followup.message_id = "$restart-followup"
+    followup.metadata["conversation_mentioned"] = False
+    await second.handle_message(followup)
+
+    assert len(second.delivered) == 1
+    gate._throttled_evaluate.assert_awaited_once()
+    await second.disconnect()
+
+
+@pytest.mark.anyio
 async def test_peer_thread_stays_passive_until_next_open_message(tmp_path):
     adapter = Adapter(Platform.MATRIX, {
         "relevance": {"enabled": True},
