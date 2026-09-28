@@ -121,3 +121,28 @@ async def test_quoted_group_reply_uses_authenticated_parent_sender(parent_sender
     adapter._event_context_cache.resolve.assert_awaited_once()
     assert reply.is_own_message is is_own
     assert reply.author_id == parent_sender
+
+
+@pytest.mark.anyio
+async def test_thread_fallback_exposes_parent_for_groupchat_without_becoming_a_quote():
+    adapter = MatrixAdapter(PlatformConfig(extra={"user_id": "@agent:example.test"}))
+    source = adapter.build_source(
+        chat_id="!lab:example.test", chat_type="group",
+        user_id="@human:example.test", thread_id="$root", message_id="$child",
+    )
+    adapter._is_sender_authorized = lambda *args, **kwargs: True
+    adapter._is_bot_mentioned = MagicMock(return_value=False)
+    adapter._event_context_cache.resolve = AsyncMock(
+        return_value=MatrixEventContext("@agent:example.test", "Earlier bot message"))
+    relates_to = {"rel_type": "m.thread", "event_id": "$root", "is_falling_back": True,
+                  "m.in_reply_to": {"event_id": "$parent"}}
+
+    event = await adapter._build_inbound_event(
+        "!lab:example.test", "@human:example.test", "$child", "Please proceed",
+        {"msgtype": "m.text", "body": "Please proceed"}, relates_to,
+        ctx=("Please proceed", False, "group", "$root", "Human", source),
+    )
+
+    assert event.reply_to_message_id is None
+    assert event.metadata["conversation_reply_anchor_id"] == "$parent"
+    assert event.reply_to_is_own_message is True

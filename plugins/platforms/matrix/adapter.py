@@ -2332,6 +2332,26 @@ class MatrixAdapter(BasePlatformAdapter):
             body = ""  # transport filename, not user text
         metadata = dict(extra.pop("metadata", {}) or {})
         metadata["conversation_mentioned"] = is_mentioned
+        relation = MatrixRelation.from_content(relates_to)
+        fallback_parent = relation.thread_fallback_target
+        if fallback_parent:
+            # Matrix's is_falling_back relation is not an explicit quote, so do
+            # not rewrite reply_to_message_id. Groupchat still needs its trusted
+            # event anchor to reactivate a previously passive request.
+            metadata["conversation_reply_anchor_id"] = fallback_parent
+            if chat_type == "group" and self._is_sender_authorized(
+                sender, chat_type=chat_type, chat_id=room_id
+            ) is not False:
+                parent = await self._event_context_cache.resolve(
+                    self._client, room_id, fallback_parent, self._cache_quoted_image,
+                )
+                if parent is not None and parent.sender == self._user_id:
+                    reply = MatrixReplyContext(
+                        body=reply.body, event_id=reply.event_id, text=reply.text,
+                        author_id=reply.author_id, author_name=reply.author_name,
+                        is_own_message=True, author_authorized=reply.author_authorized,
+                        media_path=reply.media_path, media_type=reply.media_type,
+                    )
         return MessageEvent(
             text=body, source=source, raw_message=source_content, message_id=event_id,
             reply_to_message_id=reply.event_id, reply_to_text=reply.text, reply_to_author_id=reply.author_id,

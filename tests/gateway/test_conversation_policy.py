@@ -458,7 +458,9 @@ async def test_direct_followup_reactivates_passive_request_in_same_thread(tmp_pa
 
     followup = event(Platform.MATRIX, thread="$root", text="Lena?")
     followup.message_id = "$followup"
-    followup.reply_to_message_id = original.message_id
+    # Element's m.thread fallback carries the concrete parent outside the
+    # ordinary reply_to_message_id field.
+    followup.metadata["conversation_reply_anchor_id"] = original.message_id
     followup.metadata["conversation_mentioned"] = True
     await adapter.handle_message(followup)
 

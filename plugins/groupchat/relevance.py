@@ -1118,16 +1118,15 @@ class IntelligentReactionGate:
         # participant keeps the complete reply chain as passive score-1 context.
         own_name_match = bool(self._name_pattern_for_room(room).search(text))
         peer_name_match = self._is_peer_addressed_by_name(text)
+        reply_anchor = (msg_event.reply_to_message_id
+                        or (msg_event.metadata or {}).get("conversation_reply_anchor_id"))
         own_reply = bool(
-            msg_event.reply_to_message_id
-            and msg_event.reply_to_message_id in self._own_message_ids.get(room, set())
+            reply_anchor and reply_anchor in self._own_message_ids.get(room, set())
         )
         if own_reply:
             is_mentioned = True
         inherited_peer_target = bool(
-            msg_event.reply_to_message_id
-            and msg_event.reply_to_message_id
-            in self._peer_targeted_event_ids.get(room, set())
+            reply_anchor and reply_anchor in self._peer_targeted_event_ids.get(room, set())
         )
         if not is_mentioned and own_name_match:
             is_mentioned = True
@@ -1178,7 +1177,7 @@ class IntelligentReactionGate:
             # replying to that exact event. Treat it as the current request,
             # not as historic context with a "do not answer" instruction.
             promoted = next((entry for entry in self._passive_context.get(room, [])
-                             if entry.event_id == msg_event.reply_to_message_id
+                             if entry.event_id == reply_anchor
                              and entry.sender == sender), None)
             if promoted is not None:
                 msg_event = dataclasses.replace(
@@ -1244,13 +1243,13 @@ class IntelligentReactionGate:
         def _is_thread_continuation() -> bool:
             """Return True if this message replies to one where we were addressed
             or to one we sent ourselves."""
-            if not msg_event.reply_to_message_id:
+            if not reply_anchor:
                 return False
-            mentioned = msg_event.reply_to_message_id in self._mentioned_event_ids.get(room, set())
-            own = msg_event.reply_to_message_id in self._own_message_ids.get(room, set())
+            mentioned = reply_anchor in self._mentioned_event_ids.get(room, set())
+            own = reply_anchor in self._own_message_ids.get(room, set())
             logger.debug(
                 "Conversation IR: reply_to=%s mentioned=%s own=%s",
-                msg_event.reply_to_message_id, mentioned, own,
+                reply_anchor, mentioned, own,
             )
             return mentioned or own
 
