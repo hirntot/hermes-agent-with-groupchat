@@ -917,6 +917,8 @@ class MatrixAdapter(BasePlatformAdapter):
         # Extra-first: the YAML bridge seeds these into extra and skips the env write under a
         # multiplexed secondary scope, where os.environ holds the DEFAULT profile's flags.
         self._auto_thread: bool = self._extra_truthy(config, "auto_thread", "MATRIX_AUTO_THREAD", "true")
+        # Opt-in classification runs after Groupchat admission, before the gateway claims a session.
+        self._smart_threading: bool = self._configured_bool(config, "smart_threading") is True
         self._dm_auto_thread: bool = _env_truthy("MATRIX_DM_AUTO_THREAD", "false")
         self._dm_mention_threads: bool = self._extra_truthy(config, "dm_mention_threads", "MATRIX_DM_MENTION_THREADS", "false")
         raw_session_scope = str(_extra_or_secret(config.extra, "session_scope", "MATRIX_SESSION_SCOPE", "auto")).strip().lower()
@@ -2197,8 +2199,9 @@ class MatrixAdapter(BasePlatformAdapter):
             if is_dm:
                 synthetic = (self._dm_mention_threads and is_mentioned) or self._dm_auto_thread
             else:
-                synthetic = self._matrix_session_scope == "thread" or (
+                synthetic = not self._smart_threading and (self._matrix_session_scope == "thread" or (
                     self._matrix_session_scope != "room" and self._auto_thread)
+                )
             if synthetic:
                 thread_id = event_id
         if voice_gate is not None:  # decided (parked or passing): don't hold bare mentions any longer
@@ -2333,6 +2336,30 @@ class MatrixAdapter(BasePlatformAdapter):
             reply_to_author_authorized=reply.author_authorized,
             # Top-level sender fields mirror source.* — downstream prompt code reads them.
             user_id=sender, user_name=display_name, metadata=metadata, **extra)
+
+    async def _handle_message_after_conversation(self, event: MessageEvent) -> None:
+        """Choose a new Matrix thread only after groupchat has admitted the message.
+
+        Routing must happen before BasePlatformAdapter derives the session key. Existing
+        Matrix threads and explicit replies keep their original conversation identity.
+        """
+        source = event.source
+        if (self._smart_threading and source is not None and source.chat_type == "group"
+                and not source.thread_id and not event.reply_to_message_id and not event.internal
+                and not event.is_command() and event.message_type == MessageType.TEXT
+                and event.message_id and not (event.metadata or {}).get("gateway_session_key")):
+            from plugins.platforms.matrix.thread_choice import wants_thread
+
+            model = next((handler.filter_model for handler in self.conversation_middleware().handlers
+                          if getattr(handler, "filter_model", None)), None)
+            if model and await wants_thread(event.text, model):
+                source.thread_id = event.message_id
+                source.parent_chat_id = source.chat_id
+                # Groupchat scored this in the main lane. Its historic room context must
+                # not become the first prompt of an otherwise isolated thread.
+                event.channel_context = None
+                await self._threads.mark_async(event.message_id)
+        await super()._handle_message_after_conversation(event)
 
     async def _handle_text_message(
         self, room_id: str, sender: str, event_id: str, event_ts: float, source_content: dict,
@@ -3446,6 +3473,8 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     seeded = _apply_yaml_bridge(matrix_cfg, _YAML_BRIDGE) or {}
     if "thread_backfill_limit" in matrix_cfg:
         seeded["thread_backfill_limit"] = matrix_cfg["thread_backfill_limit"]
+    if "smart_threading" in matrix_cfg:
+        seeded["smart_threading"] = matrix_cfg["smart_threading"]
     return seeded or None
 
 
