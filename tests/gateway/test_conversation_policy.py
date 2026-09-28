@@ -474,6 +474,125 @@ async def test_direct_followup_reactivates_passive_request_in_same_thread(tmp_pa
 
 
 @pytest.mark.anyio
+async def test_unaddressed_matrix_thread_is_context_until_addressed(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().for_conversation(
+        "same-room", thread_id="$foreign").relevance
+    gate._throttled_evaluate = AsyncMock(
+        side_effect=AssertionError("unaddressed thread reached scorer"))
+    observation = event(
+        Platform.MATRIX, thread="$foreign", text="A useful detail for later")
+    observation.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(observation)
+
+    assert adapter.delivered == []
+    assert gate._passive_context["same-room"][0].text == observation.text
+
+    addressed = event(Platform.MATRIX, thread="$foreign", text="Lena, please check now")
+    addressed.message_id = "$addressed"
+    addressed.metadata["conversation_mentioned"] = True
+    await adapter.handle_message(addressed)
+
+    assert len(adapter.delivered) == 1
+    assert adapter.delivered[0].text.startswith(addressed.text)
+    assert observation.text in (adapter.delivered[0].channel_context or "")
+    assert "Separate learning notes" not in (adapter.delivered[0].channel_context or "")
+    assert not gate._passive_context.get("same-room")
+
+    notes_file = tmp_path / "groupchat/matrix-thread-learning-notes.json"
+    notes = json.loads(notes_file.read_text(encoding="utf-8"))["notes"]
+    assert notes[0]["text"] == observation.text
+    main = event(Platform.MATRIX, text="Lena, please answer in the main chat")
+    main.message_id = "$main"
+    main.metadata["conversation_mentioned"] = True
+    await adapter.handle_message(main)
+    assert len(adapter.delivered) == 2
+    main_context = adapter.delivered[-1].channel_context or ""
+    assert str(notes_file) in main_context
+    assert observation.text not in main_context
+
+    deletion = event(Platform.MATRIX, thread="$foreign",
+                     text=f"[DELETE:{observation.message_id}]")
+    deletion.message_id = "$deletion"
+    deletion.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(deletion)
+    assert json.loads(notes_file.read_text(encoding="utf-8"))["notes"] == []
+    assert len(adapter.delivered) == 2
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("root_mentioned", [True, False])
+async def test_only_addressed_root_keeps_thread_active_without_new_mention(
+    tmp_path, root_mentioned,
+):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().for_conversation(
+        "same-room", thread_id="$handled-root", scope_id="sender").relevance
+    root = event(Platform.MATRIX, text=(
+        "Lena, please work on this" if root_mentioned else "Please work on this"
+    ))
+    root.message_id = "$handled-root"
+    root.source.scope_id = "sender"
+    root.metadata["conversation_mentioned"] = root_mentioned
+    if not root_mentioned:
+        adapter.conversation_policy().for_conversation(
+            "same-room", scope_id="sender").relevance._throttled_evaluate = AsyncMock(
+            return_value=(5, "This request needs a reply."))
+    await adapter.handle_message(root)
+    assert len(adapter.delivered) == 1
+
+    gate._throttled_evaluate = AsyncMock(return_value=(5, "Relevant follow-up."))
+    followup = event(
+        Platform.MATRIX, thread="$handled-root", text="There is another detail")
+    followup.message_id = "$thread-followup"
+    followup.source.scope_id = "sender"
+    followup.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(followup)
+
+    assert len(adapter.delivered) == (2 if root_mentioned else 1)
+    if root_mentioned:
+        assert adapter.delivered[-1].text.startswith(followup.text)
+        gate._throttled_evaluate.assert_awaited_once()
+    else:
+        gate._throttled_evaluate.assert_not_awaited()
+        assert gate._passive_context["same-room"][0].text == followup.text
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
+async def test_addressed_matrix_root_remains_active_after_gateway_restart(tmp_path):
+    settings = {"relevance": {"enabled": True},
+                "pingpong_guard": {"enabled": False}}
+    first = Adapter(Platform.MATRIX, settings)
+    root = event(Platform.MATRIX, text="Lena, please work on this")
+    root.message_id = "$restart-root"
+    root.metadata["conversation_mentioned"] = True
+    await first.handle_message(root)
+    roots_file = tmp_path / "groupchat/matrix-active-thread-roots.json"
+    assert roots_file.exists()
+    await first.disconnect()
+
+    second = Adapter(Platform.MATRIX, settings)
+    gate = second.conversation_policy().for_conversation(
+        "same-room", thread_id="$restart-root").relevance
+    gate._throttled_evaluate = AsyncMock(return_value=(5, "Relevant follow-up."))
+    followup = event(Platform.MATRIX, thread="$restart-root",
+                     text="There is another detail")
+    followup.message_id = "$restart-followup"
+    followup.metadata["conversation_mentioned"] = False
+    await second.handle_message(followup)
+
+    assert len(second.delivered) == 1
+    gate._throttled_evaluate.assert_awaited_once()
+    await second.disconnect()
+
+
+@pytest.mark.anyio
 async def test_peer_thread_stays_passive_until_next_open_message(tmp_path):
     adapter = Adapter(Platform.MATRIX, {
         "relevance": {"enabled": True},
@@ -883,7 +1002,7 @@ async def test_thread_and_main_context_stay_separate(tmp_path, restart):
         gate._throttled_evaluate = AsyncMock(return_value=(5, "Respond now."))
         trigger = event(Platform.MATRIX, thread=thread, text="Please continue.")
         trigger.message_id = "trigger-" + marker
-        trigger.metadata["conversation_mentioned"] = False
+        trigger.metadata["conversation_mentioned"] = thread is not None
         await adapter.handle_message(trigger)
         delivered = adapter.delivered[-1]
         context = delivered.channel_context or ""

@@ -187,7 +187,19 @@ class GroupchatAddon:
                 shared_coordination=self.coordination,
             )
             self._scopes[key].bind(self._dispatch)
-        return self._scopes[key]
+        scoped = self._scopes[key]
+        # A real Matrix thread root is delivered as a room message before
+        # replies acquire thread_id. Its room lane may be scoped by sender,
+        # so check every existing lane for a mention/reply to us or our own
+        # root message. Transfer only this ownership fact, not its history.
+        if self.platform == "matrix" and thread and scoped.relevance is not None:
+            gates = [p.relevance for p in (self, *self._scopes.values())]
+            if any(gate is not None and (
+                thread in gate._mentioned_event_ids.get(chat_id, set())
+                or thread in gate._own_message_ids.get(chat_id, set())
+            ) for gate in gates):
+                scoped.relevance._mentioned_event_ids.setdefault(chat_id, set()).add(thread)
+        return scoped
 
     async def close(self):
         self._closed = True
