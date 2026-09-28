@@ -41,10 +41,8 @@ class GroupchatAddon:
         self.guard_enabled = False
         self.guard_settings = {}
         self.scope = scope
-        # Relevance queues and outbound context remain isolated per normalized
-        # conversation, but every lane in the same adapter observes one room
-        # timeline. This lets an agent understand an elliptical top-level
-        # message without merging Matrix thread sessions.
+        # Every normalized conversation owns its transcript and passive context.
+        # Room-wide history must not redirect a reply inside an unrelated thread.
         self._shared_room_transcript = (
             shared_room_transcript
             if shared_room_transcript is not None
@@ -111,6 +109,7 @@ class GroupchatAddon:
                 room_transcript=self._shared_room_transcript,
                 passive_context=self._shared_passive_context,
                 peer_targeted_event_ids=self._shared_peer_targeted_ids,
+                context_scope=self.scope or "main",
             )
 
     def bind(self, dispatch):
@@ -176,15 +175,9 @@ class GroupchatAddon:
         key = json.dumps([str(chat_id), str(thread or ""), str(workspace or "")])
         if key not in self._scopes:
             digest = hashlib.sha256(key.encode()).hexdigest()[:20]
-            room_transcript = self._workspace_room_transcripts.setdefault(
-                str(workspace or ""), {}
-            )
-            passive_context = self._workspace_passive_contexts.setdefault(
-                str(workspace or ""), {}
-            )
-            peer_targeted_ids = self._workspace_peer_targeted_ids.setdefault(
-                str(workspace or ""), {}
-            )
+            room_transcript = self._workspace_room_transcripts.setdefault(key, {})
+            passive_context = self._workspace_passive_contexts.setdefault(key, {})
+            peer_targeted_ids = self._workspace_peer_targeted_ids.setdefault(key, {})
             self._scopes[key] = GroupchatAddon(
                 self.adapter,
                 scope=digest,

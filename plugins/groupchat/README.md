@@ -96,7 +96,7 @@ messages as context. Scores have these meanings:
 
 A later dispatched message receives retained score-1 context. Passive context
 survives gateway restarts in
-`HERMES_HOME/groupchat/passive-context.<platform>.json` and is removed after
+`HERMES_HOME/groupchat/passive-context.<platform>.<scope>.json` and is removed after
 successful dispatch. The directory is mode `0700`; state files are mode
 `0600` and written atomically because they contain private conversation text.
 
@@ -267,3 +267,9 @@ scripts/run_tests.sh \
 The tests cover plugin discovery, normalized ingress and egress, relevance
 scoring, passive restart-safe context, outbound suppression, authorization,
 thread/workspace isolation, configuration validation, and audit privacy.
+
+Thread context is strictly scoped: the main chat and each thread have separate
+relevance history, passive context, and pending queues. Scoped passive context
+survives restarts. Legacy unscoped backlog files remain on disk but are not loaded
+because their messages cannot reliably be attributed to individual threads.
+Existing model conversation histories are not rewritten.

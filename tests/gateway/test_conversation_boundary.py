@@ -54,7 +54,7 @@ async def test_filtered_caption_does_not_drop_attachment():
 
 
 @pytest.mark.anyio
-async def test_matrix_threads_share_room_context_but_keep_distinct_buffers():
+async def test_matrix_threads_keep_distinct_context_and_buffers():
     adapter = NativeAdapter(Platform.MATRIX, {"relevance": {"enabled": True}})
     a, b = event(Platform.MATRIX, thread="thread-a"), event(Platform.MATRIX, thread="thread-b")
     await adapter.handle_message(a)
@@ -63,7 +63,7 @@ async def test_matrix_threads_share_room_context_but_keep_distinct_buffers():
     first = root.for_conversation(a.source.chat_id, ConversationKey.from_source(a.source).metadata())
     second = root.for_conversation(b.source.chat_id, ConversationKey.from_source(b.source).metadata())
     assert first is not second and first is not root
-    assert first.relevance._room_transcript is second.relevance._room_transcript
+    assert first.relevance._room_transcript is not second.relevance._room_transcript
     assert first.relevance._pending is not second.relevance._pending
     assert first.last_inbound[a.source.chat_id] == a.text
     assert second.last_inbound[b.source.chat_id] == b.text
