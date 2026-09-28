@@ -180,7 +180,7 @@ async def test_matrix_thread_backfill_reaches_new_session_only():
     adapter.fetch_thread_context = AsyncMock(
         return_value="[Earlier messages in this thread]\n[alice] root @file:private.txt"
     )
-    runner._intake_adapter_for = lambda source: adapter
+    runner.adapters = {Platform.MATRIX: adapter}
     runner._expand_inbound_context_references = AsyncMock(return_value="expanded")
     source = SessionSource(
         platform=Platform.MATRIX, chat_id="!room:example.org", chat_type="group",
@@ -225,7 +225,7 @@ async def test_matrix_thread_backfill_keeps_separate_thread_contexts():
     adapter.fetch_thread_context = AsyncMock(
         side_effect=lambda room, root, **kwargs: contexts[root]
     )
-    runner._intake_adapter_for = lambda source: adapter
+    runner.adapters = {Platform.MATRIX: adapter}
 
     prepared = []
     for root, event_id in (("$first-root", "$first-reply"), ("$second-root", "$second-reply")):

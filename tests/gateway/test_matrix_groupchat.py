@@ -48,9 +48,6 @@ async def test_normalized_event_carries_native_mention_signal():
     adapter._resolve_message_context = AsyncMock(
         return_value=("hello", False, "group", None, "Human", source)
     )
-    adapter._extract_reply_context = AsyncMock(
-        return_value=("hello", None, None, None, None)
-    )
     adapter._is_bot_mentioned = MagicMock(return_value=True)
 
     event = await adapter._build_inbound_event(
