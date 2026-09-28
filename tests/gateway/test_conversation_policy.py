@@ -474,6 +474,35 @@ async def test_direct_followup_reactivates_passive_request_in_same_thread(tmp_pa
 
 
 @pytest.mark.anyio
+async def test_unaddressed_matrix_thread_is_context_until_addressed(tmp_path):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().for_conversation(
+        "same-room", thread_id="$foreign").relevance
+    gate._throttled_evaluate = AsyncMock(
+        side_effect=AssertionError("unaddressed thread reached scorer"))
+    observation = event(
+        Platform.MATRIX, thread="$foreign", text="A useful detail for later")
+    observation.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(observation)
+
+    assert adapter.delivered == []
+    assert gate._passive_context["same-room"][0].text == observation.text
+
+    addressed = event(Platform.MATRIX, thread="$foreign", text="Lena, please check now")
+    addressed.message_id = "$addressed"
+    addressed.metadata["conversation_mentioned"] = True
+    await adapter.handle_message(addressed)
+
+    assert len(adapter.delivered) == 1
+    assert adapter.delivered[0].text.startswith(addressed.text)
+    assert observation.text in (adapter.delivered[0].channel_context or "")
+    assert not gate._passive_context.get("same-room")
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
 async def test_peer_thread_stays_passive_until_next_open_message(tmp_path):
     adapter = Adapter(Platform.MATRIX, {
         "relevance": {"enabled": True},
@@ -883,7 +912,7 @@ async def test_thread_and_main_context_stay_separate(tmp_path, restart):
         gate._throttled_evaluate = AsyncMock(return_value=(5, "Respond now."))
         trigger = event(Platform.MATRIX, thread=thread, text="Please continue.")
         trigger.message_id = "trigger-" + marker
-        trigger.metadata["conversation_mentioned"] = False
+        trigger.metadata["conversation_mentioned"] = thread is not None
         await adapter.handle_message(trigger)
         delivered = adapter.delivered[-1]
         context = delivered.channel_context or ""

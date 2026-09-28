@@ -1200,6 +1200,20 @@ class IntelligentReactionGate:
             _commit_to_transcript()
             return
 
+        # A Matrix thread is a separate conversation. An unaddressed message in
+        # it may be useful later, but must not start an agent turn merely because
+        # a relevance model considers the topic interesting. Replies to our own
+        # messages have already become direct mentions above.
+        if self._platform == "matrix" and msg_event.source.thread_id:
+            self._retain_passive_context(room, msg_event, sender)
+            self._audit(
+                msg_event, phase="decision", decision="retain_context",
+                reason_code="unaddressed_thread_context", score=1,
+                buffered_count=len(self._passive_context.get(room, [])),
+                dispatch_attempted=False,
+            )
+            return
+
         # Voice/audio messages are forwarded using a recency-aware gate so that
         # not every agent in the room transcribes the same voice memo.
         if msg_event.message_type in (MessageType.AUDIO, MessageType.VOICE):
