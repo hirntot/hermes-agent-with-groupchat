@@ -187,7 +187,15 @@ class GroupchatAddon:
                 shared_coordination=self.coordination,
             )
             self._scopes[key].bind(self._dispatch)
-        return self._scopes[key]
+        scoped = self._scopes[key]
+        # A real Matrix thread root is delivered as a room message before
+        # replies acquire thread_id. Pass root ownership to its isolated lane.
+        if (self.platform == "matrix" and thread and self.relevance is not None
+                and scoped.relevance is not None
+                and (thread in self.relevance._dispatched_event_ids.get(chat_id, set())
+                     or thread in self.relevance._own_message_ids.get(chat_id, set()))):
+            scoped.relevance._dispatched_event_ids.setdefault(chat_id, set()).add(thread)
+        return scoped
 
     async def close(self):
         self._closed = True

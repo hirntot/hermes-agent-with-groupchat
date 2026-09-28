@@ -331,6 +331,7 @@ class IntelligentReactionGate:
         if not self._passive_context:
             self._passive_context.update(self._load_passive_context())
         self._mentioned_event_ids: Dict[str, Set[str]] = {}
+        self._dispatched_event_ids: Dict[str, Set[str]] = {}
         # Messages explicitly addressed to another local Groupchat profile.
         # Replies to these stay context-only unless this agent is mentioned.
         self._peer_targeted_event_ids: Dict[str, Set[str]] = (
@@ -1200,11 +1201,13 @@ class IntelligentReactionGate:
             _commit_to_transcript()
             return
 
-        # A Matrix thread is a separate conversation. An unaddressed message in
-        # it may be useful later, but must not start an agent turn merely because
-        # a relevance model considers the topic interesting. Replies to our own
-        # messages have already become direct mentions above.
-        if self._platform == "matrix" and msg_event.source.thread_id:
+        # Only follow a Matrix thread without a new address when we handled
+        # its root. A later mention in somebody else's thread answers that
+        # turn, but does not make us an active participant in the whole thread.
+        # Replies to our own messages have already become direct mentions.
+        thread_root = msg_event.source.thread_id
+        if (self._platform == "matrix" and thread_root
+                and thread_root not in self._dispatched_event_ids.get(room, set())):
             self._retain_passive_context(room, msg_event, sender)
             self._audit(
                 msg_event, phase="decision", decision="retain_context",
@@ -1588,6 +1591,8 @@ class IntelligentReactionGate:
                 )
             raise
         for event, _ in buf.events:
+            if event.message_id:
+                self._dispatched_event_ids.setdefault(room, set()).add(event.message_id)
             self._audit(
                 event,
                 phase="dispatch_result",

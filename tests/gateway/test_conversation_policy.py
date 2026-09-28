@@ -503,6 +503,40 @@ async def test_unaddressed_matrix_thread_is_context_until_addressed(tmp_path):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("root_mentioned", [True, False])
+async def test_thread_with_handled_root_can_be_scored_without_new_mention(
+    tmp_path, root_mentioned,
+):
+    adapter = Adapter(Platform.MATRIX, {
+        "relevance": {"enabled": True}, "pingpong_guard": {"enabled": False},
+    })
+    gate = adapter.conversation_policy().for_conversation(
+        "same-room", thread_id="$handled-root").relevance
+    root = event(Platform.MATRIX, text=(
+        "Lena, please work on this" if root_mentioned else "Please work on this"
+    ))
+    root.message_id = "$handled-root"
+    root.metadata["conversation_mentioned"] = root_mentioned
+    if not root_mentioned:
+        adapter.conversation_policy().relevance._throttled_evaluate = AsyncMock(
+            return_value=(5, "This request needs a reply."))
+    await adapter.handle_message(root)
+    assert len(adapter.delivered) == 1
+
+    gate._throttled_evaluate = AsyncMock(return_value=(5, "Relevant follow-up."))
+    followup = event(
+        Platform.MATRIX, thread="$handled-root", text="There is another detail")
+    followup.message_id = "$thread-followup"
+    followup.metadata["conversation_mentioned"] = False
+    await adapter.handle_message(followup)
+
+    assert len(adapter.delivered) == 2
+    assert adapter.delivered[-1].text.startswith(followup.text)
+    gate._throttled_evaluate.assert_awaited_once()
+    await adapter.disconnect()
+
+
+@pytest.mark.anyio
 async def test_peer_thread_stays_passive_until_next_open_message(tmp_path):
     adapter = Adapter(Platform.MATRIX, {
         "relevance": {"enabled": True},
