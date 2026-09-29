@@ -444,7 +444,7 @@ def enabled():
     from hermes_constants import get_hermes_home
     import hermes_yaml as yaml
     path = get_hermes_home() / "config.yaml"
-    config = yaml.safe_load(path.read_text()) if path.exists() else {}
+    config = yaml.safe_load(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
     group = (config or {}).get("groupchat") or {}
     return group.get("enabled") is True and (group.get("coordination") or {}).get("enabled") is True
 
